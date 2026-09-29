@@ -344,45 +344,29 @@ vec_dot_q1_0_q8_1(const void *__restrict__ vbq,
     return d1 * bq8_1_chunk->ds[0] * sumi;
 }
 
-#define VDR_PTQ1_0_Q8_1_MMVQ 4
+// Two lanes share a block. Half h takes qs words 2h and 2h+1 (elements 16*t + 8*h + 4*k), qs word 4+h
+// (elements 80 + 8*t + 4*h) and trits 2h, 2h+1 of qh (elements 120 + 4*h ..). So each half holds 16
+// elements of every q8_1 block, and a row of 5120 (40 blocks) fills all 16 lanes.
+#define VDR_PTQ1_0_Q8_1_MMVQ 2
+
+// w_lo and w_hi hold bytes 0,2 and 1,3 of a word in 16-bit lanes, after the multiply by 3 that moves
+// the next trit to bits 8-9 of each lane. Returns the four trits as bytes 0..2 in element order.
+static __dpct_inline__ int ptq1_0_trits_4(const uint32_t w_lo, const uint32_t w_hi) {
+    return ((w_lo >> 8) & 0x00030003) | (w_hi & 0x03000300);
+}
 
 static __dpct_inline__ float
 vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
                     const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
-    GGML_UNUSED(iqs);
     const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq;
+    const int            h       = iqs / VDR_PTQ1_0_Q8_1_MMVQ;
     int                  sumi[4] = { 0, 0, 0, 0 };
 
-    // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes
 #pragma unroll
-    for (int g = 0; g < 4; ++g) {
-        const uint32_t packed = get_int_from_uint8_aligned(bq->qs, g);
-        uint32_t v_lo = (packed & 0x000000FF) | ((packed & 0x0000FF00) << 8);
-        uint32_t v_hi = ((packed >> 16) & 0x000000FF) | ((packed & 0xFF000000) >> 8);
-
-#pragma unroll
-        for (int t = 0; t < 5; ++t) {
-            const uint32_t w_lo = v_lo * 3;
-            const uint32_t w_hi = v_hi * 3;
-            v_lo = w_lo & 0x00FF00FF;
-            v_hi = w_hi & 0x00FF00FF;
-
-            const uint32_t perm = ((w_lo >> 8) & 0x000000FF) |
-                                  ((w_lo >> 16) & 0x0000FF00) |
-                                  ((w_hi << 8)  & 0x00FF0000) |
-                                  (w_hi         & 0xFF000000);
-            const int q = byte_sub_4(perm, 0x01010101);
-            const int e = t * 16 + 4 * g;
-            const int u = get_int_from_int8_aligned(bq8_1[e >> 5].qs, (e & 31) >> 2);
-            sumi[e >> 5] = dpct::dp4a(q, u, sumi[e >> 5]);
-        }
-    }
-
-#pragma unroll
-    for (int g = 0; g < 2; ++g) {
-        const uint32_t packed = get_int_from_uint8_aligned(bq->qs + 16, g);
-        uint32_t v_lo = (packed & 0x000000FF) | ((packed & 0x0000FF00) << 8);
-        uint32_t v_hi = ((packed >> 16) & 0x000000FF) | ((packed & 0xFF000000) >> 8);
+    for (int k = 0; k < 3; ++k) {
+        const uint32_t packed = get_int_from_uint8(bq->qs, k < 2 ? 2 * h + k : 4 + h);
+        uint32_t       v_lo   = packed & 0x00FF00FF;
+        uint32_t       v_hi   = (packed >> 8) & 0x00FF00FF;
 
 #pragma unroll
         for (int t = 0; t < 5; ++t) {
@@ -391,38 +375,27 @@ vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
             v_lo = w_lo & 0x00FF00FF;
             v_hi = w_hi & 0x00FF00FF;
 
-            const uint32_t perm = ((w_lo >> 8) & 0x000000FF) |
-                                  ((w_lo >> 16) & 0x0000FF00) |
-                                  ((w_hi << 8)  & 0x00FF0000) |
-                                  (w_hi         & 0xFF000000);
-            const int q = byte_sub_4(perm, 0x01010101);
-            const int e = 80 + t * 8 + 4 * g;
-            const int u = get_int_from_int8_aligned(bq8_1[e >> 5].qs, (e & 31) >> 2);
-            sumi[e >> 5] = dpct::dp4a(q, u, sumi[e >> 5]);
+            // the q8_1 block does not depend on h, so sumi keeps constant indices
+            const int ib = k < 2 ? t >> 1 : (80 + 8 * t) >> 5;
+            const int iu = k < 2 ? 4 * (t & 1) + 2 * h + k : ((80 + 8 * t) & 31) / 4 + h;
+            const int u  = get_int_from_int8_aligned(bq8_1[ib].qs, iu);
+            sumi[ib] = dpct::dp4a(ptq1_0_trits_4(w_lo, w_hi), u, sumi[ib]);
         }
     }
 
-    uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
-#pragma unroll
-    for (int t = 0; t < 4; t += 2) {
-        const uint32_t w0 = v * 3;
-        v = w0 & 0x00FF00FF;
-        const uint32_t w1 = v * 3;
-        v = w1 & 0x00FF00FF;
+    // Element 120 + 4*h + j is trit 2h + j/2 of qh[j & 1]; the multiply puts trits 2h and 2h+1 in the two lanes
+    const uint32_t m    = h == 0 ? 0x00030001 : 0x001B0009;
+    const uint32_t v_lo = (bq->qh[0] * m) & 0x00FF00FF;
+    const uint32_t v_hi = (bq->qh[1] * m) & 0x00FF00FF;
+    const int      u    = get_int_from_int8_aligned(bq8_1[3].qs, 6 + h);
+    sumi[3] = dpct::dp4a(ptq1_0_trits_4(v_lo * 3, v_hi * 3), u, sumi[3]);
 
-        const uint32_t perm = ((w0 >> 8) & 0x000000FF) |
-                              ((w0 >> 16) & 0x0000FF00) |
-                              ((w1 << 8)  & 0x00FF0000) |
-                              (w1         & 0xFF000000);
-        const int q = byte_sub_4(perm, 0x01010101);
-        const int u = get_int_from_int8_aligned(bq8_1[3].qs, 6 + t / 2);
-        sumi[3] = dpct::dp4a(q, u, sumi[3]);
-    }
-
+    // Trits are 0..2, so subtract the q8_1 sum once. Each half covers half of every q8_1 block.
     float acc = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        acc += ((const float) bq8_1[k].ds[0]) * (float) sumi[k];
+    for (int i = 0; i < 4; ++i) {
+        const sycl::float2 ds8f = bq8_1[i].ds.convert<float, sycl::rounding_mode::automatic>();
+        acc += ds8f.x() * sumi[i] - 0.5f * ds8f.y();
     }
     return (float) bq->d * acc;
 }
