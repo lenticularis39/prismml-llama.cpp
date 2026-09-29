@@ -46,8 +46,8 @@ static constexpr float H20[20][20] = {
 #undef P
 #undef N
 
-template <int N>
-static void fwht_kernel(const float * __restrict__ src, float * __restrict__ dst, const int64_t n_rows,
+template <int N, typename T>
+static void fwht_kernel(const T * __restrict__ src, float * __restrict__ dst, const int64_t n_rows,
                         const float scale, const sycl::nd_item<2> & item) {
     const sycl::sub_group sg = item.get_sub_group();
 
@@ -67,7 +67,7 @@ static void fwht_kernel(const float * __restrict__ src, float * __restrict__ dst
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * WARP_SIZE + lane] * scale;
+        reg[i] = (float) src[i * WARP_SIZE + lane] * scale;
     }
 
     // Butterflies inside the sub-group. The partner of a lane with bit h clear is the
@@ -107,8 +107,8 @@ static void fwht_kernel(const float * __restrict__ src, float * __restrict__ dst
     }
 }
 
-template <int N>
-static void launch_fwht(const float * src, float * dst, const int64_t n_rows, const float scale,
+template <int N, typename T>
+static void launch_fwht(const T * src, float * dst, const int64_t n_rows, const float scale,
                         dpct::queue_ptr stream) {
     constexpr int rows_per_block = 4;
 
@@ -120,7 +120,7 @@ static void launch_fwht(const float * src, float * dst, const int64_t n_rows, co
 
     stream->parallel_for(sycl::nd_range<2>(global, local),
                          [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             fwht_kernel<N>(src, dst, n_rows, scale, item);
+                             fwht_kernel<N, T>(src, dst, n_rows, scale, item);
                          });
 }
 
@@ -128,8 +128,8 @@ static void launch_fwht(const float * src, float * dst, const int64_t n_rows, co
 // keeps N/NT values rather than N/WARP_SIZE. Butterflies below the sub-group width
 // still shuffle; those up to NT go through work-group local memory; the rest stay
 // in registers.
-template <int N, int NT>
-static void fwht_kernel_wide(const float * __restrict__ src,
+template <int N, int NT, typename T>
+static void fwht_kernel_wide(const T * __restrict__ src,
                              float * __restrict__ dst,
                              const int64_t            n_rows,
                              const float              scale,
@@ -151,7 +151,7 @@ static void fwht_kernel_wide(const float * __restrict__ src,
     float reg[el_w];
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * NT + tid] * scale;
+        reg[i] = (float) src[i * NT + tid] * scale;
     }
 
     const sycl::sub_group sg   = item.get_sub_group();
@@ -207,8 +207,8 @@ static void fwht_kernel_wide(const float * __restrict__ src,
     }
 }
 
-template <int N, int NT>
-static void launch_fwht_wide(const float *   src,
+template <int N, int NT, typename T>
+static void launch_fwht_wide(const T *   src,
                              float *         dst,
                              const int64_t   n_rows,
                              const float     scale,
@@ -220,13 +220,13 @@ static void launch_fwht_wide(const float *   src,
         sycl::local_accessor<float, 1> smem(sycl::range<1>(N), cgh);
         cgh.parallel_for(sycl::nd_range<2>(global, local),
                          [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             fwht_kernel_wide<N, NT>(src, dst, n_rows, scale, item, get_pointer(smem));
+                             fwht_kernel_wide<N, NT, T>(src, dst, n_rows, scale, item, get_pointer(smem));
                          });
     });
 }
 
-template <int N, int m>
-static void kronecker_kernel(const float * __restrict__ src,
+template <int N, int m, typename T>
+static void kronecker_kernel(const T * __restrict__ src,
                              float * __restrict__ dst,
                              const int64_t            n_rows,
                              const float              scale,
@@ -255,7 +255,7 @@ static void kronecker_kernel(const float * __restrict__ src,
 
 #pragma unroll
         for (int j = 0; j < m; ++j) {
-            reg[i * m + j] = src[b_idx * m + j] * scale;
+            reg[i * m + j] = (float) src[b_idx * m + j] * scale;
         }
     }
 
@@ -321,8 +321,8 @@ static void kronecker_kernel(const float * __restrict__ src,
     }
 }
 
-template <int N, int m>
-static void launch_kronecker(const float *   src,
+template <int N, int m, typename T>
+static void launch_kronecker(const T *   src,
                              float *         dst,
                              const int64_t   n_rows,
                              const float     scale,
@@ -337,12 +337,58 @@ static void launch_kronecker(const float *   src,
 
     stream->parallel_for(sycl::nd_range<2>(global, local),
                          [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             kronecker_kernel<N, m>(src, dst, n_rows, scale, item);
+                             kronecker_kernel<N, m, T>(src, dst, n_rows, scale, item);
                          });
 }
 
+template <typename T>
+static bool fwht_dispatch(const T * src_d, float * dst_d, const int n, const int64_t rows, dpct::queue_ptr stream) {
+    const float scale = 1.0f / std::sqrt((float) n);
+
+    switch (n) {
+        case 64:
+            launch_fwht<64, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 128:
+            launch_fwht<128, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 256:
+            launch_fwht<256, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 512:
+            launch_fwht<512, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 384:
+            launch_kronecker<384, 12, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 768:
+            launch_kronecker<768, 12, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 640:
+            launch_kronecker<640, 20, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 1280:
+            launch_kronecker<1280, 20, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 1024:
+            launch_fwht_wide<1024, 256, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 2048:
+            launch_fwht_wide<2048, 256, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 4096:
+            launch_fwht_wide<4096, 256, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 8192:
+            launch_fwht_wide<8192, 256, T>(src_d, dst_d, rows, scale, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
-    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if ((src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
         return false;
     }
     if (!ggml_are_same_shape(src, dst)) {
@@ -352,55 +398,16 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
         return false;
     }
 
-    const int     n    = (int) src->ne[0];
-    const int64_t rows = ggml_nrows(src);
-
-    const float *   src_d  = (const float *) src->data;
+    const int       n      = (int) src->ne[0];
+    const int64_t   rows   = ggml_nrows(src);
     float *         dst_d  = (float *) dst->data;
     dpct::queue_ptr stream = ctx.stream();
 
-    const float scale = 1.0f / std::sqrt((float) n);
-
-    switch (n) {
-        case 64:
-            launch_fwht<64>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 128:
-            launch_fwht<128>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 256:
-            launch_fwht<256>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 512:
-            launch_fwht<512>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 384:
-            launch_kronecker<384, 12>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 768:
-            launch_kronecker<768, 12>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 640:
-            launch_kronecker<640, 20>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 1280:
-            launch_kronecker<1280, 20>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 1024:
-            launch_fwht_wide<1024, 256>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 2048:
-            launch_fwht_wide<2048, 256>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 4096:
-            launch_fwht_wide<4096, 256>(src_d, dst_d, rows, scale, stream);
-            return true;
-        case 8192:
-            launch_fwht_wide<8192, 256>(src_d, dst_d, rows, scale, stream);
-            return true;
-        default:
-            return false;
+    // F16 input is widened on load; the transform itself always runs in F32
+    if (src->type == GGML_TYPE_F16) {
+        return fwht_dispatch((const sycl::half *) src->data, dst_d, n, rows, stream);
     }
+    return fwht_dispatch((const float *) src->data, dst_d, n, rows, stream);
 }
 
 // ARC-LAB (Torchit1/llama.cpp arc-b580): FWHT with the Hadamard sign flip done during the load
