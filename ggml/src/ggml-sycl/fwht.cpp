@@ -80,6 +80,100 @@ static void launch_fwht(const float * src, float * dst, const int64_t n_rows, co
                          });
 }
 
+// Wide rows: one work-group per row. The sub-group kernel above would need N/WARP_SIZE
+// registers per lane and puts a whole row on one sub-group, so rows from 1024 up used to
+// fall back to a oneMKL GEMM with the dense N x N matrix.
+#define FWHT_BLOCK_THREADS 256
+
+template <int N, int NT>
+static void fwht_block_kernel(const float * __restrict__ src, float * __restrict__ dst, const float scale,
+                              float * __restrict__ s, const sycl::nd_item<1> & item) {
+    constexpr int NE = N / NT;
+    static_assert(NE >= 1 && N % NT == 0 && NT % WARP_SIZE == 0, "bad FWHT block shape");
+
+    const sycl::sub_group sg = item.get_sub_group();
+
+    const int64_t r   = item.get_group(0);
+    const int     tid = item.get_local_id(0);
+
+    src += r * N;
+    dst += r * N;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = src[i * NT + tid] * scale;
+    }
+
+    // stages inside a sub-group: the partner differs in the lane bits
+#pragma unroll
+    for (int h = 1; h < WARP_SIZE; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < NE; ++j) {
+            const float val  = reg[j];
+            const float val2 = dpct::permute_sub_group_by_xor(sg, val, h, WARP_SIZE);
+
+            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+
+    // stages across sub-groups: the partner differs in the work-item bits above the lane
+#pragma unroll
+    for (int h = WARP_SIZE; h < NT; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < NE; ++j) {
+            s[j * NT + tid] = reg[j];
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+        for (int j = 0; j < NE; ++j) {
+            const float val  = reg[j];
+            const float val2 = s[j * NT + (tid ^ h)];
+
+            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    // stages above the work-group width: the partner is another register of the same work-item
+#pragma unroll
+    for (int h = NT; h < N; h *= 2) {
+        const int step = h / NT;
+#pragma unroll
+        for (int j = 0; j < NE; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; ++k) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        dst[i * NT + tid] = reg[i];
+    }
+}
+
+template <int N>
+static void launch_fwht_block(const float * src, float * dst, const int64_t n_rows, const float scale,
+                              dpct::queue_ptr stream) {
+    constexpr int NT = FWHT_BLOCK_THREADS;
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> s(sycl::range<1>(N), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(n_rows * NT, NT),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             fwht_block_kernel<N, NT>(src, dst, scale,
+                                                      s.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
+    });
+}
+
 bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
@@ -112,6 +206,18 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
             return true;
         case 512:
             launch_fwht<512>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 1024:
+            launch_fwht_block<1024>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 2048:
+            launch_fwht_block<2048>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 4096:
+            launch_fwht_block<4096>(src_d, dst_d, rows, scale, stream);
+            return true;
+        case 8192:
+            launch_fwht_block<8192>(src_d, dst_d, rows, scale, stream);
             return true;
         default:
             return false;
