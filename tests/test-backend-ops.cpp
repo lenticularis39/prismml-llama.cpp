@@ -4543,6 +4543,90 @@ struct test_gdn_replay_chain : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS -> GGML_OP_GATED_DELTA_NET (-> GGML_OP_CPY), as build_rs builds a decode step:
+// one cache row is gathered as the state and the new state is optionally written back to the cache.
+// Backends may skip the gather and read the cache row directly.
+struct test_gated_delta_net_gather : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t cache_rows;
+    const int64_t read_row;
+    const int64_t write_row; // -1 => no write-back
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_GATHER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_count, head_size, cache_rows, read_row, write_row);
+    }
+
+    test_gated_delta_net_gather(int64_t head_count = 4, int64_t head_size = 64, int64_t cache_rows = 3,
+                                int64_t read_row = 1, int64_t write_row = -1)
+        : head_count(head_count), head_size(head_size), cache_rows(cache_rows), read_row(read_row), write_row(write_row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = head_size * head_size * head_count;
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, 1, 1);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, 1, 1);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, 1, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, 1, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, 1, 1);
+        ggml_set_name(v,    "v");
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, cache_rows);
+        ggml_tensor * rows   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * state = ggml_get_rows(ctx, states, rows);
+        state = ggml_reshape_4d(ctx, state, head_size, head_size, head_count, 1);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        if (write_row < 0) {
+            return gdn_out;
+        }
+
+        // with a write-back, backends may write the new state straight into the cache and skip the
+        // state tail of gdn_out, as nothing else reads it. So check the attention output and the
+        // written cache row instead, joined after the cpy so that it stays next to the gdn.
+        const int64_t attn_elems = head_size * head_count;
+        ggml_tensor * new_state = ggml_view_3d(ctx, gdn_out, D, 1, 1,
+            ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D),
+            ggml_row_size(GGML_TYPE_F32, attn_elems));
+        ggml_tensor * dst = ggml_view_3d(ctx, states, D, 1, 1,
+            states->nb[1], states->nb[1] * cache_rows, write_row * states->nb[1]);
+        ggml_tensor * written = ggml_cpy(ctx, new_state, dst);
+        ggml_tensor * attn    = ggml_cont(ctx, ggml_view_1d(ctx, gdn_out, attn_elems, 0));
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, written, D), attn, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "rows") == 0) {
+                const int32_t row = (int32_t) read_row;
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
@@ -11595,6 +11679,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int nt : {16, 32, 64, 128}) {  // ARC-LAB: Bonsai shape (48 v-heads), draft-verify batch sizes
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3));
     }
+    test_cases.emplace_back(new test_gated_delta_net_gather(4, 64, 3, 1));
+    test_cases.emplace_back(new test_gated_delta_net_gather(4, 128, 3, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_gather(4, 128, 3, 2, 0));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
