@@ -5680,8 +5680,86 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// match get_rows -> gated_delta_net: the recurrent state of each seq is gathered out of the cache
+// and only read by the gdn as its state input. The kernel can read the cache rows itself, so the
+// gather (a full state copy per layer) is skipped. Single seq only: each work-item then reads and
+// writes the same state elements, so a cache write-back of the new state cannot race the read.
+// returns the index of the gdn node that takes over the read, or -1
+static int ggml_sycl_try_gdn_state_gather_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                                 ggml_sycl_gated_delta_net_state_rows & state_rows) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return -1;
+    }
+
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_nrows(gr) != 1 || !ggml_is_contiguous(gr)) {
+        return -1;
+    }
+
+    const ggml_tensor * states = gr->src[0];
+    const ggml_tensor * ids    = gr->src[1];
+    if (states->type != GGML_TYPE_F32 || states->nb[0] != sizeof(float) || states->ne[0] != gr->ne[0] ||
+        ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1) {
+        return -1;
+    }
+
+    const char * s_beg = (const char *) states->data;
+    const char * s_end = s_beg + ggml_nbytes(states);
+
+    int gdn_idx = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+
+        bool uses_gr = false;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            uses_gr = uses_gr || (s != nullptr && (s == gr || s->view_src == gr));
+        }
+
+        if (uses_gr) {
+            if (ggml_sycl_is_view_or_noop(n) && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                continue;
+            }
+            const ggml_tensor * st = n->src[5];
+            const bool          ok = gdn_idx < 0 && n->op == GGML_OP_GATED_DELTA_NET && n->src[6] == nullptr &&
+                            st->data == gr->data && ggml_nelements(st) == gr->ne[0] && n->src[2]->ne[3] == 1;
+            for (int k = 0; ok && k < 5; ++k) {
+                if (n->src[k] == gr || n->src[k]->view_src == gr) {
+                    return -1;
+                }
+            }
+            if (!ok) {
+                return -1;
+            }
+            gdn_idx = j;
+            continue;
+        }
+
+        // nothing between the gather and the gdn may write into the cache it reads
+        if (gdn_idx < 0 && !ggml_sycl_is_view_or_noop(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            const char * d_beg = (const char *) n->data;
+            const char * d_end = d_beg + ggml_nbytes(n);
+            if (d_beg < s_end && s_beg < d_end) {
+                return -1;
+            }
+        }
+    }
+
+    if (gdn_idx >= 0) {
+        state_rows.states   = (const float *) states->data;
+        state_rows.rows     = (const int32_t *) ids->data;
+        state_rows.row_size = (int64_t) (states->nb[1] / sizeof(float));
+    }
+    return gdn_idx;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+    // gdn node that reads its state from the cache instead of a skipped get_rows
+    const ggml_tensor *                  gdn_rows_node = nullptr;
+    ggml_sycl_gated_delta_net_state_rows gdn_rows      = {};
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -5705,13 +5783,28 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        // get_rows -> gated_delta_net: the gdn reads the state rows from the cache itself
+        if (node->op == GGML_OP_GET_ROWS && gdn_rows_node == nullptr) {
+            const int gdn_idx = ggml_sycl_try_gdn_state_gather_fusion(cgraph, i, gdn_rows);
+            if (gdn_idx >= 0) {
+                gdn_rows_node = cgraph->nodes[gdn_idx];
+                continue;
+            }
+        }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
+            const ggml_sycl_gated_delta_net_state_rows * rows = node == gdn_rows_node ? &gdn_rows : nullptr;
+            gdn_rows_node = nullptr;
+
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
-                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
+                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy, rows);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+            if (rows) {
+                ggml_sycl_op_gated_delta_net(*sycl_ctx, node, rows);
                 continue;
             }
         }
