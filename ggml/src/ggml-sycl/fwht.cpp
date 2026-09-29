@@ -2,8 +2,8 @@
 
 #include <cmath>
 
-template <int N>
-static void fwht_kernel(const float * __restrict__ src, float * __restrict__ dst, const int64_t n_rows,
+template <int N, typename T>
+static void fwht_kernel(const T * __restrict__ src, float * __restrict__ dst, const int64_t n_rows,
                         const float scale, const sycl::nd_item<2> & item) {
     const sycl::sub_group sg = item.get_sub_group();
 
@@ -23,7 +23,7 @@ static void fwht_kernel(const float * __restrict__ src, float * __restrict__ dst
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * WARP_SIZE + lane] * scale;
+        reg[i] = (float) src[i * WARP_SIZE + lane] * scale;
     }
 
     // Butterflies inside the sub-group. The partner of a lane with bit h clear is the
@@ -63,8 +63,8 @@ static void fwht_kernel(const float * __restrict__ src, float * __restrict__ dst
     }
 }
 
-template <int N>
-static void launch_fwht(const float * src, float * dst, const int64_t n_rows, const float scale,
+template <int N, typename T>
+static void launch_fwht(const T * src, float * dst, const int64_t n_rows, const float scale,
                         dpct::queue_ptr stream) {
     constexpr int rows_per_block = 4;
 
@@ -76,7 +76,7 @@ static void launch_fwht(const float * src, float * dst, const int64_t n_rows, co
 
     stream->parallel_for(sycl::nd_range<2>(global, local),
                          [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             fwht_kernel<N>(src, dst, n_rows, scale, item);
+                             fwht_kernel<N, T>(src, dst, n_rows, scale, item);
                          });
 }
 
@@ -85,8 +85,8 @@ static void launch_fwht(const float * src, float * dst, const int64_t n_rows, co
 // fall back to a oneMKL GEMM with the dense N x N matrix.
 #define FWHT_BLOCK_THREADS 256
 
-template <int N, int NT>
-static void fwht_block_kernel(const float * __restrict__ src, float * __restrict__ dst, const float scale,
+template <int N, int NT, typename T>
+static void fwht_block_kernel(const T * __restrict__ src, float * __restrict__ dst, const float scale,
                               float * __restrict__ s, const sycl::nd_item<1> & item) {
     constexpr int NE = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % WARP_SIZE == 0, "bad FWHT block shape");
@@ -102,7 +102,7 @@ static void fwht_block_kernel(const float * __restrict__ src, float * __restrict
     float reg[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
-        reg[i] = src[i * NT + tid] * scale;
+        reg[i] = (float) src[i * NT + tid] * scale;
     }
 
     // stages inside a sub-group: the partner differs in the lane bits
@@ -158,8 +158,8 @@ static void fwht_block_kernel(const float * __restrict__ src, float * __restrict
     }
 }
 
-template <int N>
-static void launch_fwht_block(const float * src, float * dst, const int64_t n_rows, const float scale,
+template <int N, typename T>
+static void launch_fwht_block(const T * src, float * dst, const int64_t n_rows, const float scale,
                               dpct::queue_ptr stream) {
     constexpr int NT = FWHT_BLOCK_THREADS;
 
@@ -168,30 +168,14 @@ static void launch_fwht_block(const float * src, float * dst, const int64_t n_ro
 
         cgh.parallel_for(sycl::nd_range<1>(n_rows * NT, NT),
                          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             fwht_block_kernel<N, NT>(src, dst, scale,
+                             fwht_block_kernel<N, NT, T>(src, dst, scale,
                                                       s.get_multi_ptr<sycl::access::decorated::no>().get(), item);
                          });
     });
 }
 
-bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
-    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-    if (!ggml_are_same_shape(src, dst)) {
-        return false;
-    }
-    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
-        return false;
-    }
-
-    const int     n    = (int) src->ne[0];
-    const int64_t rows = ggml_nrows(src);
-
-    const float *   src_d  = (const float *) src->data;
-    float *         dst_d  = (float *) dst->data;
-    dpct::queue_ptr stream = ctx.stream();
-
+template <typename T>
+static bool fwht_dispatch(const T * src_d, float * dst_d, const int n, const int64_t rows, dpct::queue_ptr stream) {
     const float scale = 1.0f / std::sqrt((float) n);
 
     switch (n) {
@@ -222,4 +206,27 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
         default:
             return false;
     }
+}
+
+bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+    if ((src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src, dst)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int       n      = (int) src->ne[0];
+    const int64_t   rows   = ggml_nrows(src);
+    float *         dst_d  = (float *) dst->data;
+    dpct::queue_ptr stream = ctx.stream();
+
+    // F16 input is widened on load; the transform itself always runs in F32
+    if (src->type == GGML_TYPE_F16) {
+        return fwht_dispatch((const sycl::half *) src->data, dst_d, n, rows, stream);
+    }
+    return fwht_dispatch((const float *) src->data, dst_d, n, rows, stream);
 }
