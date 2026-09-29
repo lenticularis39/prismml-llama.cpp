@@ -4450,22 +4450,12 @@ struct test_gated_delta_net_gather : public test_case {
     const int64_t read_row;
     const int64_t write_row; // -1 => no write-back
 
-    ggml_tensor * gdn_out = nullptr;
-    ggml_tensor * written = nullptr;
-
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "GATED_DELTA_NET_GATHER";
     }
 
     bool run_whole_graph() override { return true; }
-
-    std::vector<ggml_tensor *> fusion_test_nodes() override {
-        if (written) {
-            return { gdn_out, written };
-        }
-        return { gdn_out };
-    }
 
     std::string vars() override {
         return VARS_TO_STR5(head_count, head_size, cache_rows, read_row, write_row);
@@ -4496,18 +4486,23 @@ struct test_gated_delta_net_gather : public test_case {
         ggml_tensor * state = ggml_get_rows(ctx, states, rows);
         state = ggml_reshape_4d(ctx, state, head_size, head_size, head_count, 1);
 
-        gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
         if (write_row < 0) {
             return gdn_out;
         }
 
+        // with a write-back, backends may write the new state straight into the cache and skip the
+        // state tail of gdn_out, as nothing else reads it. So check the attention output and the
+        // written cache row instead, joined after the cpy so that it stays next to the gdn.
+        const int64_t attn_elems = head_size * head_count;
         ggml_tensor * new_state = ggml_view_3d(ctx, gdn_out, D, 1, 1,
             ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D),
-            ggml_row_size(GGML_TYPE_F32, head_size * head_count));
+            ggml_row_size(GGML_TYPE_F32, attn_elems));
         ggml_tensor * dst = ggml_view_3d(ctx, states, D, 1, 1,
             states->nb[1], states->nb[1] * cache_rows, write_row * states->nb[1]);
-        written = ggml_cpy(ctx, new_state, dst);
-        return written;
+        ggml_tensor * written = ggml_cpy(ctx, new_state, dst);
+        ggml_tensor * attn    = ggml_cont(ctx, ggml_view_1d(ctx, gdn_out, attn_elems, 0));
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, written, D), attn, 0);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
