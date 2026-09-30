@@ -24,4 +24,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// bf16 src0 times 1-8 contiguous f32 columns with a kernel that reads the weights once. Returns false,
+// having done nothing, for other types and shapes.
+bool ggml_sycl_mul_mat_vec_bf16(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                ggml_tensor * dst);
+
 #endif // GGML_SYCL_DMMV_HPP

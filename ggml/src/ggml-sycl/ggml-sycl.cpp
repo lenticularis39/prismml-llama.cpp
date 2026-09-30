@@ -4651,6 +4651,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+    } else if (!split && src1->ne[1] >= 2 && ggml_sycl_mul_mat_vec_bf16(ctx, src0, src1, dst)) {
+        // done: a few columns of bf16 weights, e.g. speculative verification. On Meteor Lake the oneDNN GEMM
+        // took 607 us for 4 columns where one column takes 48 us through DMMV.
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);

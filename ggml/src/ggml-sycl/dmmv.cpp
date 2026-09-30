@@ -2225,3 +2225,97 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     GGML_UNUSED(src1_padded_row_size);
     GGML_UNUSED(ctx);
 }
+
+// bf16 weights times up to 8 f32 columns, reading the weights once: a sub-group per row and 8 values per
+// work-item and step. The columns stay f32, where the one-column DMMV kernel converts them to half.
+template <int ncols>
+static void mul_mat_vec_bf16_f32(const uint16_t * __restrict__ x, const float * __restrict__ y,
+                                 float * __restrict__ dst, const int ne00, const int nrows, const int stride_y,
+                                 const int stride_dst, const sycl::nd_item<3> & item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    if (row >= nrows) {
+        return;
+    }
+    const int        lane = item_ct1.get_local_id(2);
+    const uint16_t * xr   = x + (size_t) row * ne00;
+
+    float tmp[ncols] = {};
+    for (int k = 8 * lane; k < ne00; k += 8 * WARP_SIZE) {
+        // bf16 is the high half of an f32
+        const sycl::vec<uint32_t, 4> w = *reinterpret_cast<const sycl::vec<uint32_t, 4> *>(xr + k);
+        float                        wf[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            wf[2 * i + 0] = sycl::bit_cast<float>((uint32_t) (w[i] << 16));
+            wf[2 * i + 1] = sycl::bit_cast<float>((uint32_t) (w[i] & 0xFFFF0000u));
+        }
+#pragma unroll
+        for (int c = 0; c < ncols; ++c) {
+            const float *               yc = y + (size_t) c * stride_y + k;
+            const sycl::vec<float, 4> y0 = *reinterpret_cast<const sycl::vec<float, 4> *>(yc);
+            const sycl::vec<float, 4> y1 = *reinterpret_cast<const sycl::vec<float, 4> *>(yc + 4);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                tmp[c] += wf[i] * y0[i] + wf[4 + i] * y1[i];
+            }
+        }
+    }
+
+    const auto sg = item_ct1.get_sub_group();
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+        float v = tmp[c];
+#pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+            v += dpct::permute_sub_group_by_xor(sg, v, mask);
+        }
+        if (lane == 0) {
+            dst[(size_t) c * stride_dst + row] = v;
+        }
+    }
+}
+
+template <int ncols>
+static void mul_mat_vec_bf16_f32_sycl(const uint16_t * x, const float * y, float * dst, const int ne00,
+                                      const int nrows, const int stride_y, const int stride_dst,
+                                      dpct::queue_ptr stream) {
+    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_bf16_f32<ncols>(x, y, dst, ne00, nrows, stride_y, stride_dst, item_ct1);
+                         });
+}
+
+bool ggml_sycl_mul_mat_vec_bf16(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                ggml_tensor * dst) {
+    const int64_t ncols = src1->ne[1];
+    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < 1 ||
+        ncols > 8 || src0->ne[0] % (8 * WARP_SIZE) != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const uint16_t * x          = (const uint16_t *) src0->data;
+    const float *    y          = (const float *) src1->data;
+    float *          d          = (float *) dst->data;
+    const int        ne00       = src0->ne[0];
+    const int        nrows      = src0->ne[1];
+    const int        stride_y   = src1->nb[1] / sizeof(float);
+    const int        stride_dst = dst->nb[1] / sizeof(float);
+    dpct::queue_ptr  stream     = ctx.stream();
+
+    switch (ncols) {
+        case 1: mul_mat_vec_bf16_f32_sycl<1>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+        case 2: mul_mat_vec_bf16_f32_sycl<2>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+        case 3: mul_mat_vec_bf16_f32_sycl<3>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+        case 4: mul_mat_vec_bf16_f32_sycl<4>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+        case 5: mul_mat_vec_bf16_f32_sycl<5>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+        case 6: mul_mat_vec_bf16_f32_sycl<6>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+        case 7: mul_mat_vec_bf16_f32_sycl<7>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+        case 8: mul_mat_vec_bf16_f32_sycl<8>(x, y, d, ne00, nrows, stride_y, stride_dst, stream); break;
+    }
+    return true;
+}
