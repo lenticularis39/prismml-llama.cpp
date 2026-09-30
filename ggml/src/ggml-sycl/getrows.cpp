@@ -277,8 +277,14 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             src1_i32, (float *)dst->data, ctx.stream());
             break;
         case GGML_TYPE_PTQ1_0:
-            get_rows_sycl<QK_PTQ1_0, 1, dequantize_ptq1_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
-            src1_i32, (float *)dst->data, ctx.stream());
+            // a weight shared with a mat-mul may have been reordered by it
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                get_rows_sycl<QK_PTQ1_0, 1, dequantize_ptq1_0_reorder>(ctx, dst->src[0], dst->src[1], dst,
+                    (const float *)dst->src[0]->data, src1_i32, (float *)dst->data, ctx.stream());
+            } else {
+                get_rows_sycl<QK_PTQ1_0, 1, dequantize_ptq1_0>(ctx, dst->src[0], dst->src[1], dst,
+                    (const float *)dst->src[0]->data, src1_i32, (float *)dst->data, ctx.stream());
+            }
             break;
         case GGML_TYPE_PQ2_0:
             get_rows_sycl<QK_PQ2_0, 1, dequantize_pq2_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,

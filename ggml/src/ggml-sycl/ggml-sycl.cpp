@@ -593,7 +593,8 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
-            case GGML_TYPE_Q6_K:{
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_PTQ1_0:{
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
                 tensor->extra                 = extra;
                 ctx->tensor_extras.push_back(extra);
@@ -3799,6 +3800,7 @@ inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
 
 inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
     switch (type) {
+        case GGML_TYPE_PTQ1_0:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
@@ -4410,6 +4412,37 @@ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
     return true;
 }
 
+// Moves word w of block b in each group of 8 PTQ1_0 blocks to ptq1_0_reorder_word(b, w), the layout
+// mul_mat_vec_ptq1_0_q8_1_act reads with sub-group block loads. Same size, so it is done in place.
+static bool reorder_qw_ptq1_0(uint8_t * data_device, size_t size, dpct::queue_ptr stream) {
+    GGML_ASSERT(size % (8 * sizeof(block_ptq1_0)) == 0);
+    static_assert(sizeof(block_ptq1_0) == 7 * sizeof(uint32_t), "PTQ1_0 blocks must be 7 words");
+
+    sycl_reorder_temp_buffer tmp(stream, size);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
+        return false;
+    }
+    const uint32_t * src = static_cast<const uint32_t *>(tmp.ptr);
+    uint32_t *       dst = (uint32_t *) data_device;
+
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp.ptr, data_device, size)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    auto reorder_event = stream->parallel_for(size / sizeof(uint32_t), [=](sycl::id<1> id) {
+        const size_t i = id[0];
+        const int    j = i % 56;
+        dst[i - j + ptq1_0_reorder_word(j / 7, j % 7)] = src[i];
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+
 static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     uint8_t * data_device = (uint8_t *) src0->data;
     size_t ncols = src0->ne[0];
@@ -4447,6 +4480,10 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             return reorder_qw_q5_k(data_device, size, 0, stream);
         case GGML_TYPE_Q6_K:
             return reorder_qw_q6_k(data_device, size, 0, stream);
+        case GGML_TYPE_PTQ1_0:
+            // only the q8_1 layout of mul_mat_vec_ptq1_0_q8_1_act reads the lane order
+            return ggml_sycl_ptq1_0_act_weights(src0) &&
+                   reorder_qw_ptq1_0(data_device, size, stream);
         default:
             return false;
     }
@@ -4526,7 +4563,7 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     return ggml_sycl_supports_mmvq(src0->type) &&
            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+           (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE || ggml_sycl_ptq1_0_act_layout(src0, src1));
 }
 
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4620,7 +4657,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (use_mul_mat_vec_q) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-        if (extra && extra->optimized_feature.reorder) {
+        if (ggml_sycl_ptq1_0_act_layout(src0, src1)) {
+            ggml_sycl_op_mul_mat<quantize_q8_1_ptq1_0>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+        } else if (extra && extra->optimized_feature.reorder) {
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
@@ -4654,6 +4693,11 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
 
     // with DMMV prioritised the unfused path would not have gone through mmvq at all
     if (g_ggml_sycl_prioritize_dmmv) {
+        return false;
+    }
+
+    // the fused kernel has no PTQ1_0 variant; bail before quantizing src1 for it
+    if (wu->type == GGML_TYPE_PTQ1_0 || wg->type == GGML_TYPE_PTQ1_0) {
         return false;
     }
 

@@ -350,9 +350,11 @@ vec_dot_q1_0_q8_1(const void *__restrict__ vbq,
 #define VDR_PTQ1_0_Q8_1_MMVQ 2
 
 // w_lo and w_hi hold bytes 0,2 and 1,3 of a word in 16-bit lanes, after the multiply by 3 that moves
-// the next trit to bits 8-9 of each lane. Returns the four trits as bytes 0..2 in element order.
+// the next trit to bits 8-9 of each lane. Returns the four trits as bytes 0..2 in element order. The lanes
+// are at most 3 * 255, so their high bytes are the trits and complementary masks suffice: a shift and one
+// bit select instead of a shift, two ands and an or.
 static __dpct_inline__ int ptq1_0_trits_4(const uint32_t w_lo, const uint32_t w_hi) {
-    return ((w_lo >> 8) & 0x00030003) | (w_hi & 0x03000300);
+    return ((w_lo >> 8) & 0x00FF00FF) | (w_hi & 0xFF00FF00);
 }
 
 static __dpct_inline__ float

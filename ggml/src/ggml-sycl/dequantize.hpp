@@ -13,6 +13,8 @@
 #ifndef GGML_SYCL_DEQUANTIZE_HPP
 #define GGML_SYCL_DEQUANTIZE_HPP
 
+#include <array>
+
 #include "common.hpp"
 #include "convert.hpp"
 
@@ -156,6 +158,30 @@ static __dpct_inline__ void dequantize_ptq1_0(const void * vx, const int64_t ib,
 
     v.x() = ptq1_0_trit(&x[ib], iqs + 0) * d;
     v.y() = ptq1_0_trit(&x[ib], iqs + 1) * d;
+}
+
+// Lane-ordered PTQ1_0 (reorder_qw_ptq1_0): in each group of 8 blocks (56 words), words 2h and 2h+1 of
+// block b sit at 2b+h and 16+2b+h, word 4+h at 32+2b+h and word 6 (qh, d) at 48+b. Sub-group lane 2b+h
+// then reads its words of all 8 blocks with block loads.
+static __dpct_inline__ int ptq1_0_reorder_word(const int b, const int w) {
+    return w < 4 ? 16 * (w & 1) + 2 * b + (w >> 1) : (w < 6 ? 32 + 2 * b + (w - 4) : 48 + b);
+}
+
+static __dpct_inline__ void dequantize_ptq1_0_reorder(const void * vx, const int64_t ib,
+                                                      const int iqs, dfloat2 & v) {
+    const uint32_t * group = (const uint32_t *) vx + (ib / 8) * 56;
+    const int        b     = ib % 8;
+
+    std::array<uint32_t, 7> words;
+#pragma unroll
+    for (int w = 0; w < 7; ++w) {
+        words[w] = group[ptq1_0_reorder_word(b, w)];
+    }
+    const block_ptq1_0 blk = sycl::bit_cast<block_ptq1_0>(words);
+    const dfloat       d   = blk.d;
+
+    v.x() = ptq1_0_trit(&blk, iqs + 0) * d;
+    v.y() = ptq1_0_trit(&blk, iqs + 1) * d;
 }
 
 static __dpct_inline__ void dequantize_pq2_0(const void * vx, const int64_t ib,
