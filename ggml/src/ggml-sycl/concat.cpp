@@ -126,6 +126,38 @@ static void concat_T_sycl_non_cont(
     uint64_t nb11, uint64_t nb12, uint64_t nb13, int64_t ne0, int64_t ne1,
     int64_t ne2, int64_t ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2,
     uint64_t nb3, int32_t dim) {
+  // Rows narrower than a sub-group (e.g. a conv state joined with one new column): one work-item
+  // per element. A work-group per row would leave most lanes idle and launch one group per row.
+  if (ne0 < WARP_SIZE) {
+      const int64_t n      = ne0 * ne1 * ne2 * ne3;
+      const int64_t blocks = (n + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
+      const int64_t o0     = dim == 0 ? ne00 : 0;
+      const int64_t o1     = dim == 1 ? ne01 : 0;
+      const int64_t o2     = dim == 2 ? ne02 : 0;
+      const int64_t o3     = dim == 3 ? ne03 : 0;
+
+      stream->parallel_for(sycl::nd_range<1>(blocks * SYCL_CONCAT_BLOCK_SIZE, SYCL_CONCAT_BLOCK_SIZE),
+                           [=](sycl::nd_item<1> item_ct1) {
+          const int64_t i = item_ct1.get_global_id(0);
+          if (i >= n) {
+              return;
+          }
+          const int64_t i0 = i % ne0;
+          const int64_t i1 = (i / ne0) % ne1;
+          const int64_t i2 = (i / (ne0 * ne1)) % ne2;
+          const int64_t i3 = i / (ne0 * ne1 * ne2);
+
+          const T * x;
+          if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+              x = (const T *) (src0 + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00);
+          } else {
+              x = (const T *) (src1 + (i3 - o3) * nb13 + (i2 - o2) * nb12 + (i1 - o1) * nb11 + (i0 - o0) * nb10);
+          }
+          *(T *) (dst + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0) = *x;
+      });
+      return;
+  }
+
   sycl::range<3> gridDim(ne3, ne2, ne1);
 
   // Avoid oversubscribing device when there is not enough elements along the innermost dim to
@@ -169,7 +201,9 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+    // rows narrower than a sub-group (e.g. a conv state joined with one new column) take the flat
+    // per-element kernel in concat_T_sycl_non_cont: concat_T_sycl would launch a 256-wide group per row
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && (dim == 3 || dst->ne[0] >= WARP_SIZE)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T * dst_d = (T *) dst->data;
