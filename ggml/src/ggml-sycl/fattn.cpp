@@ -256,10 +256,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+            // With GQA too: for one token the tile kernel gets few work-groups (heads / ncols2) and spills
+            // heavily on Arc iGPUs. For 3 tokens with head size 256 the vector kernel took twice as long.
             if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
+                return BEST_FATTN_KERNEL_VEC;
             }
         } else {
             if (Q->ne[1] <= 2) {
