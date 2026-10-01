@@ -35,7 +35,8 @@ template <int D,
           int type_V,
           bool use_logit_softcap,
           int warp_size,
-          int nthreads>  // D == head size
+          int nthreads,
+          bool gqa_order = false>  // D == head size
 static void flash_attn_ext_vec(const char* __restrict__ Q,
                         const char* __restrict__ K,
                         const char* __restrict__ V,
@@ -118,9 +119,26 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
     const int ic0 = item_ct1.get_group(2) * ncols;  // Index of the Q/QKV column to work on.
 
-    const int sequence  = item_ct1.get_group(0) / ne02;
-    const int head      = item_ct1.get_group(0) - sequence * ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+
+    // Work-groups run roughly in launch order, parallel block (dim 1) fastest. With gqa_order the Q heads of
+    // one K/V head come fastest instead, so the gqa_ratio work-groups reading the same K/V block run together
+    // and all but the first find it in cache: decode then reads K/V from memory about once instead of once
+    // per Q head.
+    const int nblk = item_ct1.get_group_range(1);
+    int       sequence, head, blk;
+    if constexpr (gqa_order) {
+        const int l   = item_ct1.get_group(0) * nblk + item_ct1.get_group(1);
+        const int r   = l / gqa_ratio;
+        const int kvh = r / nblk;
+        blk      = r - kvh * nblk;
+        sequence = kvh / ne12;
+        head     = (kvh - sequence * ne12) * gqa_ratio + (l - r * gqa_ratio);
+    } else {
+        sequence = item_ct1.get_group(0) / ne02;
+        head     = item_ct1.get_group(0) - sequence * ne02;
+        blk      = item_ct1.get_group(1);
+    }
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
@@ -289,14 +307,14 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence * item_ct1.get_group_range(2) + item_ct1.get_group(2)] : ne11;
-    K += item_ct1.get_group(1) * nthreads * nb11;
-    V += item_ct1.get_group(1) * nthreads * nb21;
-    maskh += item_ct1.get_group(1) * nthreads;
-    for (int k_VKQ_0 = item_ct1.get_group(1) * nthreads; k_VKQ_0 < k_VKQ_max;
-         k_VKQ_0 += item_ct1.get_group_range(1) * nthreads,
+    K += blk * nthreads * nb11;
+    V += blk * nthreads * nb21;
+    maskh += blk * nthreads;
+    for (int k_VKQ_0 = blk * nthreads; k_VKQ_0 < k_VKQ_max;
+         k_VKQ_0 += nblk * nthreads,
              // Increment pointers after each loop:
-         K += item_ct1.get_group_range(1) * nthreads * nb11, V += item_ct1.get_group_range(1) * nthreads * nb21,
-             maskh += item_ct1.get_group_range(1) * nthreads) {
+         K += nblk * nthreads * nb11, V += nblk * nthreads * nb21,
+             maskh += nblk * nthreads) {
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]={}; // KQ in registers.
         float KQ_max_new[ncols]={};
@@ -421,7 +439,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         }
     }
 
-    if (sinks && item_ct1.get_group(1) == 0) {
+    if (sinks && blk == 0) {
         const float sink = ((const float *) sinks)[head];
 
 #pragma unroll
@@ -541,11 +559,11 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                         dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
                     }
                 }
-                if (item_ct1.get_group_range(1) == 1) {
+                if (nblk == 1) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
-                dst[(((sequence * int(ne01.z()) + ic0 + j_VKQ) * ne02 + head) * item_ct1.get_group_range(1) +
-                     item_ct1.get_group(1)) *
+                dst[(((sequence * int(ne01.z()) + ic0 + j_VKQ) * ne02 + head) * nblk +
+                     blk) *
                         D +
                     i0 + tid] = dst_val;
             }
@@ -557,9 +575,9 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
     }
 
-    if (item_ct1.get_group_range(1) != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z()))) {
-        dst_meta[((sequence * int(ne01.z()) + ic0 + tid) * ne02 + head) * item_ct1.get_group_range(1) +
-                 item_ct1.get_group(1)] = make_float2(KQ_max[tid], KQ_sum[tid]);
+    if (nblk != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z()))) {
+        dst_meta[((sequence * int(ne01.z()) + ic0 + tid) * ne02 + head) * nblk +
+                 blk] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
@@ -580,7 +598,218 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
 
 
-template <int D, int cols_per_block, int type_K, int type_V, bool use_logit_softcap>
+// Values 64*p .. 64*p + 63 of a Q8_0 or Q4_0 K or V row (the blocks 2p and 2p+1) as half. Two Q8_0 (68 B) or
+// Q4_0 (36 B) blocks are 4-byte aligned where one is only 2-byte aligned, so they are read as 32-bit words,
+// 17 or 9 loads instead of a byte load per value. Rows must be 4-byte aligned, as with head sizes 128 and 256.
+template <int type>
+static __dpct_inline__ void fattn_gqa_load64(const char * __restrict__ row, const int p,
+                                             sycl::vec<sycl::half, 8> (&out)[8]) {
+    static_assert(type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0, "unsupported K/V type");
+    constexpr int bs = type == GGML_TYPE_Q8_0 ? sizeof(block_q8_0) : sizeof(block_q4_0);
+    constexpr int nw = 2 * bs / 4;
+    static_assert(2 * bs % 4 == 0, "two blocks are whole 32-bit words");
+
+    const uint32_t * w = (const uint32_t *) (row + 2 * bs * p);
+    uint32_t         u[nw];
+#pragma unroll
+    for (int i = 0; i < nw; ++i) {
+        u[i] = w[i];
+    }
+    // byte j of the two blocks; j is a constant after unrolling
+    auto byte = [&](const int j) -> uint32_t { return (u[j / 4] >> (8 * (j % 4))) & 0xFF; };
+
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int   o = h * bs;
+        const float d = sycl::bit_cast<sycl::half>((uint16_t) (byte(o) | (byte(o + 1) << 8)));
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            int q;
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                q = (int8_t) byte(o + 2 + i);
+            } else {
+                q = (i < 16 ? byte(o + 2 + i) & 0xF : byte(o + 2 + i - 16) >> 4) - 8;
+            }
+            out[4 * h + i / 8][i % 8] = sycl::half(d * q);
+        }
+    }
+}
+
+// One-token flash attention for GQA: a work-group per K/V head and parallel block, with a sub-group for each
+// of its gqa_ratio Q heads. Each tile of K/V is loaded (and dequantized) into local memory once for all of
+// them, where one work-group per Q head reads it from memory gqa_ratio times. A lane holds D/16 consecutive
+// values of its head's Q and output. No alibi, sinks or logit softcap.
+template <int D, int type_K, int type_V>
+static void flash_attn_ext_vec_gqa(const char * __restrict__ Q, const char * __restrict__ K,
+                                   const char * __restrict__ V, const char * __restrict__ mask,
+                                   const char * __restrict__ sinks, const int * __restrict__ KV_max,
+                                   float * __restrict__ dst, sycl::float2 * __restrict__ dst_meta,
+                                   const float scale, const float max_bias, const float m0, const float m1,
+                                   const uint32_t n_head_log2, const float logit_softcap, const int32_t ne00,
+                                   const sycl::uint3 ne01, const int32_t ne02, const int32_t ne03,
+                                   const int32_t nb01, const int32_t nb02, const int32_t nb03, const int32_t ne10,
+                                   const int32_t ne11, const int32_t ne12, const int32_t ne13, const int32_t nb11,
+                                   const int32_t nb12, const int64_t nb13, const int32_t nb21, const int32_t nb22,
+                                   const int64_t nb23, const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                                   const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+#ifdef SYCL_FLASH_ATTN
+    constexpr int warp_size = WARP_16_SIZE;
+    constexpr int T         = 8;              // K/V rows per tile
+    constexpr int EPL       = D / warp_size;  // values of a row per lane
+    constexpr int C8        = D / 8;          // 8-value chunks per row
+    static_assert(EPL % 8 == 0 && D % 64 == 0, "a lane takes whole 8-value chunks");
+
+    auto      item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto      sg       = item_ct1.get_sub_group();
+    const int lane     = item_ct1.get_local_id(2);
+    const int g        = item_ct1.get_local_id(1);
+    const int nthreads = item_ct1.get_local_range(1) * warp_size;
+    const int tid      = g * warp_size + lane;
+
+    const int token     = item_ct1.get_group(2);
+    const int blk       = item_ct1.get_group(1);
+    const int nblk      = item_ct1.get_group_range(1);
+    const int gqa_ratio = ne02 / ne12;
+    const int sequence  = item_ct1.get_group(0) / ne12;
+    const int kvh       = item_ct1.get_group(0) - sequence * ne12;
+    const int head      = kvh * gqa_ratio + g;
+
+    Q += nb03 * sequence + nb02 * head + nb01 * token;
+    K += nb13 * sequence + nb12 * kvh;
+    V += nb23 * sequence + nb22 * kvh;
+    const sycl::half * maskh =
+        mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * token) : nullptr;
+
+    syclex::work_group_static<sycl::vec<sycl::half, 8>[2 * T * C8]> lsm;
+    sycl::vec<sycl::half, 8> * Ks = (sycl::vec<sycl::half, 8> *) &lsm;
+    sycl::vec<sycl::half, 8> * Vs = Ks + T * C8;
+
+    float q[EPL];
+    float acc[EPL];
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) {
+        q[i]   = ((const float *) Q)[EPL * lane + i] * scale;
+        acc[i] = 0.0f;
+    }
+    float kq_max = -FLT_MAX / 2.0f;
+    float kq_sum = 0.0f;
+
+    const int k_max = KV_max ? KV_max[sequence * item_ct1.get_group_range(2) + token] : ne11;
+    for (int k0 = blk * T; k0 < k_max; k0 += nblk * T) {
+        if constexpr (type_K == GGML_TYPE_F16) {
+            // a task per 8 values, consecutive lanes on consecutive 16 B of a row
+            for (int idx = tid; idx < T * C8; idx += nthreads) {
+                const int t = idx / C8;
+                const int c = idx - t * C8;
+                if (k0 + t < k_max) {
+                    Ks[idx] = ((const sycl::vec<sycl::half, 8> *) (K + (int64_t) (k0 + t) * nb11))[c];
+                    Vs[idx] = ((const sycl::vec<sycl::half, 8> *) (V + (int64_t) (k0 + t) * nb21))[c];
+                } else {
+                    // rows past the end get weight 0; keep them finite
+                    Ks[idx] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
+                    Vs[idx] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
+                }
+            }
+        } else {
+            // a task per 64 values (two blocks) of a K or V row
+            constexpr int P = D / 64;
+            for (int idx = tid; idx < 2 * T * P; idx += nthreads) {
+                const bool is_v = idx >= T * P;
+                const int  i2   = is_v ? idx - T * P : idx;
+                const int  t    = i2 / P;
+                const int  p    = i2 - t * P;
+
+                sycl::vec<sycl::half, 8> tmp[8];
+                if (k0 + t < k_max) {
+                    if (is_v) {
+                        fattn_gqa_load64<type_V>(V + (int64_t) (k0 + t) * nb21, p, tmp);
+                    } else {
+                        fattn_gqa_load64<type_K>(K + (int64_t) (k0 + t) * nb11, p, tmp);
+                    }
+                } else {
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) {
+                        tmp[c] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
+                    }
+                }
+                sycl::vec<sycl::half, 8> * out = (is_v ? Vs : Ks) + t * C8 + 8 * p;
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    out[c] = tmp[c];
+                }
+            }
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+
+        float sc[T];
+        float m_new = kq_max;
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int c = 0; c < EPL / 8; ++c) {
+                const sycl::vec<sycl::half, 8> kv = Ks[t * C8 + lane * (EPL / 8) + c];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    dot += q[8 * c + i] * float(kv[i]);
+                }
+            }
+            dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
+            if (maskh) {
+                dot += float(maskh[k0 + t]);
+            }
+            sc[t] = k0 + t < k_max ? dot : -INFINITY;
+            m_new = sycl::fmax(m_new, sc[t]);
+        }
+
+        const float corr = sycl::native::exp(kq_max - m_new);
+        kq_max = m_new;
+        kq_sum *= corr;
+#pragma unroll
+        for (int i = 0; i < EPL; ++i) {
+            acc[i] *= corr;
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float p = sycl::native::exp(sc[t] - kq_max);
+            kq_sum += p;
+#pragma unroll
+            for (int c = 0; c < EPL / 8; ++c) {
+                const sycl::vec<sycl::half, 8> vv = Vs[t * C8 + lane * (EPL / 8) + c];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    acc[8 * c + i] += p * float(vv[i]);
+                }
+            }
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+    }
+
+    const int j_dst = (sequence * int(ne01.z()) + token) * ne02 + head;
+    if (nblk == 1) {
+#pragma unroll
+        for (int i = 0; i < EPL; ++i) {
+            dst[j_dst * D + EPL * lane + i] = acc[i] / kq_sum;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < EPL; ++i) {
+            dst[(j_dst * nblk + blk) * D + EPL * lane + i] = acc[i];
+        }
+        if (lane == 0) {
+            dst_meta[j_dst * nblk + blk] = make_float2(kq_max, kq_sum);
+        }
+    }
+    GGML_UNUSED_VARS(sinks, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne13, ne31, ne32,
+                     nb32);
+#else
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale, max_bias, m0, m1, n_head_log2,
+                     logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12,
+                     nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33);
+#endif  // SYCL_FLASH_ATTN
+}
+
+template <int D, int cols_per_block, int type_K, int type_V, bool use_logit_softcap, bool gqa_order = false>
 void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
     constexpr int warp_size = WARP_16_SIZE; //better performance than WARP_32_SIZE
@@ -597,7 +826,7 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
             constexpr int nwarps = nthreads_hw / warp_size;
             launch_fattn<D, cols_per_block, 1,
                          flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
-                                            use_logit_softcap, warp_size, nthreads_hw>, warp_size>(
+                                            use_logit_softcap, warp_size, nthreads_hw, gqa_order>, warp_size>(
                 ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
             return;
         }
@@ -607,7 +836,7 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
     constexpr int nwarps = nthreads_hw / warp_size;
     launch_fattn<D, cols_per_block, 1,
                  flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
-                                    use_logit_softcap, warp_size, nthreads_hw>, warp_size>(
+                                    use_logit_softcap, warp_size, nthreads_hw, gqa_order>, warp_size>(
         ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
 }
 
@@ -621,6 +850,34 @@ void ggml_sycl_flash_attn_ext_vec_case(ggml_backend_sycl_context & ctx, ggml_ten
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
+        const ggml_tensor * K         = dst->src[1];
+        const int           gqa_ratio = Q->ne[2] / K->ne[2];
+        float               max_bias;
+        memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+        // GQA with F16, Q8_0 or Q4_0 K/V: a work-group per K/V head, see flash_attn_ext_vec_gqa
+        if constexpr ((D == 128 || D == 256) && type_K == type_V &&
+                      (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0)) {
+            if (gqa_ratio >= 2 && gqa_ratio <= 16 && logit_softcap == 0.0f && max_bias == 0.0f && !dst->src[4]) {
+                // At most ne11/nbatch parallel blocks, the work-groups beyond one per K/V head: more for short
+                // KV, fewer partial results to combine for long KV. On Meteor Lake 32 took 54 instead of 140 us
+                // at 256 KV and 128 153 instead of 167 us at 1024 KV.
+                const int nbatch = K->ne[1] <= 512 ? 32 : 128;
+                // ncols2 16 so that launch_fattn makes one work-group per K/V head (gqa_ratio <= 16)
+                launch_fattn<D, 1, 16, flash_attn_ext_vec_gqa<D, type_K, type_V>, WARP_16_SIZE>(
+                    ctx, dst, gqa_ratio, 0, nbatch, false, false, false);
+                return;
+            }
+        }
+
+        // other GQA decode with F16 or Q8_0 K/V (other types keep one kernel variant each)
+        if constexpr ((type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) ||
+                      (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0)) {
+            if (gqa_ratio > 1 && logit_softcap == 0.0f) {
+                ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, false, true>(ctx, dst);
+                return;
+            }
+        }
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
             ggml_sycl_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
