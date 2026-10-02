@@ -18,7 +18,8 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
     GGML_UNUSED(dst);
     return false;
 #else
-    if (!g_ggml_sycl_fa_onednn) {
+    // Without matrix engines the MKL path is faster (1.4-1.5x on Meteor Lake).
+    if (!g_ggml_sycl_fa_onednn || !ggml_sycl_info().devices[ggml_sycl_get_device()].has_xmx) {
         return false;
     }
     const ggml_tensor * Q     = dst->src[0];

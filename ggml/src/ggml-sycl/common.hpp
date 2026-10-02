@@ -243,6 +243,7 @@ struct sycl_device_info {
     sycl_hw_info hw_info;
     optimize_feature opt_feature;
     bool    usm_system_support; // support for USM system allocations
+    bool    has_xmx;            // matrix engines (DPAS)
 };
 
 
