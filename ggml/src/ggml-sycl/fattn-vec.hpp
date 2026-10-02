@@ -635,6 +635,44 @@ static __dpct_inline__ void fattn_gqa_load64(const char * __restrict__ row, cons
     }
 }
 
+// Rows k0 .. k0 + T - 1 of K or V (row stride nb) into local memory as half, zero past k_max
+template <int type, int D, int T>
+static __dpct_inline__ void fattn_gqa_fill(const char * __restrict__ src, const int nb, const int k0, const int k_max,
+                                           const int tid, const int nthreads, sycl::vec<sycl::half, 8> * dst) {
+    constexpr int C8 = D / 8;
+    if constexpr (type == GGML_TYPE_F16) {
+        // a task per 8 values, consecutive lanes on consecutive 16 B of a row
+        for (int idx = tid; idx < T * C8; idx += nthreads) {
+            const int t = idx / C8;
+            const int c = idx - t * C8;
+            // rows past the end get weight 0; keep them finite
+            dst[idx] = k0 + t < k_max ? ((const sycl::vec<sycl::half, 8> *) (src + (int64_t) (k0 + t) * nb))[c] :
+                                        sycl::vec<sycl::half, 8>(sycl::half(0.0f));
+        }
+    } else {
+        // a task per 64 values (two blocks) of a row
+        constexpr int P = D / 64;
+        for (int idx = tid; idx < T * P; idx += nthreads) {
+            const int t = idx / P;
+            const int p = idx - t * P;
+
+            sycl::vec<sycl::half, 8> tmp[8];
+            if (k0 + t < k_max) {
+                fattn_gqa_load64<type>(src + (int64_t) (k0 + t) * nb, p, tmp);
+            } else {
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    tmp[c] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                dst[t * C8 + 8 * p + c] = tmp[c];
+            }
+        }
+    }
+}
+
 // One-token flash attention for GQA: a work-group per K/V head and parallel block, with a sub-group for each
 // of its gqa_ratio Q heads. Each tile of K/V is loaded (and dequantized) into local memory once for all of
 // them, where one work-group per Q head reads it from memory gqa_ratio times. A lane holds D/16 consecutive
@@ -696,49 +734,8 @@ static void flash_attn_ext_vec_gqa(const char * __restrict__ Q, const char * __r
 
     const int k_max = KV_max ? KV_max[sequence * item_ct1.get_group_range(2) + token] : ne11;
     for (int k0 = blk * T; k0 < k_max; k0 += nblk * T) {
-        if constexpr (type_K == GGML_TYPE_F16) {
-            // a task per 8 values, consecutive lanes on consecutive 16 B of a row
-            for (int idx = tid; idx < T * C8; idx += nthreads) {
-                const int t = idx / C8;
-                const int c = idx - t * C8;
-                if (k0 + t < k_max) {
-                    Ks[idx] = ((const sycl::vec<sycl::half, 8> *) (K + (int64_t) (k0 + t) * nb11))[c];
-                    Vs[idx] = ((const sycl::vec<sycl::half, 8> *) (V + (int64_t) (k0 + t) * nb21))[c];
-                } else {
-                    // rows past the end get weight 0; keep them finite
-                    Ks[idx] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
-                    Vs[idx] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
-                }
-            }
-        } else {
-            // a task per 64 values (two blocks) of a K or V row
-            constexpr int P = D / 64;
-            for (int idx = tid; idx < 2 * T * P; idx += nthreads) {
-                const bool is_v = idx >= T * P;
-                const int  i2   = is_v ? idx - T * P : idx;
-                const int  t    = i2 / P;
-                const int  p    = i2 - t * P;
-
-                sycl::vec<sycl::half, 8> tmp[8];
-                if (k0 + t < k_max) {
-                    if (is_v) {
-                        fattn_gqa_load64<type_V>(V + (int64_t) (k0 + t) * nb21, p, tmp);
-                    } else {
-                        fattn_gqa_load64<type_K>(K + (int64_t) (k0 + t) * nb11, p, tmp);
-                    }
-                } else {
-#pragma unroll
-                    for (int c = 0; c < 8; ++c) {
-                        tmp[c] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
-                    }
-                }
-                sycl::vec<sycl::half, 8> * out = (is_v ? Vs : Ks) + t * C8 + 8 * p;
-#pragma unroll
-                for (int c = 0; c < 8; ++c) {
-                    out[c] = tmp[c];
-                }
-            }
-        }
+        fattn_gqa_fill<type_K, D, T>(K, nb11, k0, k_max, tid, nthreads, Ks);
+        fattn_gqa_fill<type_V, D, T>(V, nb21, k0, k_max, tid, nthreads, Vs);
         item_ct1.barrier(sycl::access::fence_space::local_space);
 
         float sc[T];
@@ -856,8 +853,9 @@ void ggml_sycl_flash_attn_ext_vec_case(ggml_backend_sycl_context & ctx, ggml_ten
         memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
         // GQA with F16, Q8_0 or Q4_0 K/V: a work-group per K/V head, see flash_attn_ext_vec_gqa
-        if constexpr ((D == 128 || D == 256) && type_K == type_V &&
-                      (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0)) {
+        if constexpr ((D == 128 || D == 256) &&
+                      (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0) &&
+                      (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0)) {
             if (gqa_ratio >= 2 && gqa_ratio <= 16 && logit_softcap == 0.0f && max_bias == 0.0f && !dst->src[4]) {
                 // At most ne11/nbatch parallel blocks, the work-groups beyond one per K/V head: more for short
                 // KV, fewer partial results to combine for long KV. On Meteor Lake 32 took 54 instead of 140 us
