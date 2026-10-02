@@ -598,12 +598,13 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
 
 
-// Values 64*p .. 64*p + 63 of a Q8_0 or Q4_0 K or V row (the blocks 2p and 2p+1) as half. Two Q8_0 (68 B) or
-// Q4_0 (36 B) blocks are 4-byte aligned where one is only 2-byte aligned, so they are read as 32-bit words,
-// 17 or 9 loads instead of a byte load per value. Rows must be 4-byte aligned, as with head sizes 128 and 256.
+// Values 64*p .. 64*p + 63 of a Q8_0 or Q4_0 K or V row (the blocks 2p and 2p+1) into dst as half. Two Q8_0
+// (68 B) or Q4_0 (36 B) blocks are 4-byte aligned where one is only 2-byte aligned, so they are read as 32-bit
+// words, 17 or 9 loads instead of a byte load per value. Rows must be 4-byte aligned, as with head sizes 128 and
+// 256. Each 8 values are stored as soon as they are converted: holding all 64 spilled registers on Meteor Lake.
 template <int type>
-static __dpct_inline__ void fattn_gqa_load64(const char * __restrict__ row, const int p,
-                                             sycl::vec<sycl::half, 8> (&out)[8]) {
+static __dpct_inline__ void fattn_gqa_dequant64(const char * __restrict__ row, const int p,
+                                                sycl::vec<sycl::half, 8> * __restrict__ dst) {
     static_assert(type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0, "unsupported K/V type");
     constexpr int bs = type == GGML_TYPE_Q8_0 ? sizeof(block_q8_0) : sizeof(block_q4_0);
     constexpr int nw = 2 * bs / 4;
@@ -623,14 +624,20 @@ static __dpct_inline__ void fattn_gqa_load64(const char * __restrict__ row, cons
         const int   o = h * bs;
         const float d = sycl::bit_cast<sycl::half>((uint16_t) (byte(o) | (byte(o + 1) << 8)));
 #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            int q;
-            if constexpr (type == GGML_TYPE_Q8_0) {
-                q = (int8_t) byte(o + 2 + i);
-            } else {
-                q = (i < 16 ? byte(o + 2 + i) & 0xF : byte(o + 2 + i - 16) >> 4) - 8;
+        for (int c = 0; c < 4; ++c) {
+            sycl::vec<sycl::half, 8> v;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int i = 8 * c + e;
+                int       q;
+                if constexpr (type == GGML_TYPE_Q8_0) {
+                    q = (int8_t) byte(o + 2 + i);
+                } else {
+                    q = (i < 16 ? byte(o + 2 + i) & 0xF : byte(o + 2 + i - 16) >> 4) - 8;
+                }
+                v[e] = sycl::half(d * q);
             }
-            out[4 * h + i / 8][i % 8] = sycl::half(d * q);
+            dst[4 * h + c] = v;
         }
     }
 }
@@ -655,19 +662,13 @@ static __dpct_inline__ void fattn_gqa_fill(const char * __restrict__ src, const 
         for (int idx = tid; idx < T * P; idx += nthreads) {
             const int t = idx / P;
             const int p = idx - t * P;
-
-            sycl::vec<sycl::half, 8> tmp[8];
             if (k0 + t < k_max) {
-                fattn_gqa_load64<type>(src + (int64_t) (k0 + t) * nb, p, tmp);
+                fattn_gqa_dequant64<type>(src + (int64_t) (k0 + t) * nb, p, dst + t * C8 + 8 * p);
             } else {
 #pragma unroll
                 for (int c = 0; c < 8; ++c) {
-                    tmp[c] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
+                    dst[t * C8 + 8 * p + c] = sycl::vec<sycl::half, 8>(sycl::half(0.0f));
                 }
-            }
-#pragma unroll
-            for (int c = 0; c < 8; ++c) {
-                dst[t * C8 + 8 * p + c] = tmp[c];
             }
         }
     }
