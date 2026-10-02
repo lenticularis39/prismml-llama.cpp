@@ -10747,6 +10747,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : { 256, 1024, 4096 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    // same shape with the KV cache layout (heads interleaved per cell), decode and speculative verification
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0 }) {
+        for (int kv : { 65536, 131072 }) {
+            for (int nb : { 1, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
     // same shape, one prompt ubatch at long context
     for (auto [type_K, type_V] : std::vector<std::pair<ggml_type, ggml_type>>{
             { GGML_TYPE_F16, GGML_TYPE_F16 }, { GGML_TYPE_Q4_0, GGML_TYPE_F16 }, { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 } }) {
