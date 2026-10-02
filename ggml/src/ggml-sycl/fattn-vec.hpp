@@ -674,11 +674,48 @@ static __dpct_inline__ void fattn_gqa_fill(const char * __restrict__ src, const 
     }
 }
 
-// One-token flash attention for GQA: a work-group per K/V head and parallel block, with a sub-group for each
-// of its gqa_ratio Q heads. Each tile of K/V is loaded (and dequantized) into local memory once for all of
-// them, where one work-group per Q head reads it from memory gqa_ratio times. A lane holds D/16 consecutive
-// values of its head's Q and output. No alibi, sinks or logit softcap.
-template <int D, int type_K, int type_V>
+// Tokens per work-group of flash_attn_ext_vec_gqa: up to 32 sub-groups (512 work-items)
+static constexpr int fattn_vec_gqa_ncols(const int64_t ne01, const int64_t gqa_ratio) {
+    int ncols = ne01 == 1 ? 1 : ne01 == 2 ? 2 : ne01 <= 4 ? 4 : 8;
+    while (ncols > 1 && gqa_ratio * ncols > 32) {
+        ncols /= 2;
+    }
+    return ncols;
+}
+
+// Whether flash_attn_ext_vec_gqa takes this op: head size 128 or 256, F16, Q8_0 or Q4_0 K and V, GQA, up to
+// 8 query tokens (decode and speculative verification), no alibi, sinks or logit softcap.
+inline bool ggml_sycl_fattn_vec_gqa_supported(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    float max_bias;
+    float logit_softcap;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    auto type_ok = [](const ggml_type t) {
+        return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+    };
+    if ((K->ne[0] != 128 && K->ne[0] != 256) || V->ne[0] != K->ne[0] || !type_ok(K->type) || !type_ok(V->type)) {
+        return false;
+    }
+    const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
+    if (gqa_ratio < 2 || gqa_ratio > 16 || Q->ne[1] > 8 || max_bias != 0.0f || logit_softcap != 0.0f ||
+        dst->src[4]) {
+        return false;
+    }
+    const int64_t nsg = gqa_ratio * fattn_vec_gqa_ncols(Q->ne[1], gqa_ratio);
+    return nsg * WARP_16_SIZE <= ggml_sycl_info().max_work_group_sizes[ggml_sycl_get_device()];
+}
+
+// Flash attention for GQA and up to 8 query tokens: a work-group per K/V head, parallel block and ncols tokens,
+// with a sub-group for each of its gqa_ratio Q heads and tokens. Each tile of K/V is loaded (and dequantized)
+// into local memory once for all of them, where a work-group per Q head and token would read it from memory
+// gqa_ratio * ncols times. A lane holds D/16 consecutive values of its Q row and output: more tokens per
+// sub-group spill registers on Meteor Lake. No alibi, sinks or logit softcap.
+template <int D, int type_K, int type_V, int ncols>
 static void flash_attn_ext_vec_gqa(const char * __restrict__ Q, const char * __restrict__ K,
                                    const char * __restrict__ V, const char * __restrict__ mask,
                                    const char * __restrict__ sinks, const int * __restrict__ KV_max,
@@ -705,19 +742,22 @@ static void flash_attn_ext_vec_gqa(const char * __restrict__ Q, const char * __r
     const int nthreads = item_ct1.get_local_range(1) * warp_size;
     const int tid      = g * warp_size + lane;
 
-    const int token     = item_ct1.get_group(2);
     const int blk       = item_ct1.get_group(1);
     const int nblk      = item_ct1.get_group_range(1);
     const int gqa_ratio = ne02 / ne12;
     const int sequence  = item_ct1.get_group(0) / ne12;
     const int kvh       = item_ct1.get_group(0) - sequence * ne12;
-    const int head      = kvh * gqa_ratio + g;
+    const int head      = kvh * gqa_ratio + g % gqa_ratio;
+    const int n_tokens  = ne01.z();
+    const int token     = item_ct1.get_group(2) * ncols + g / gqa_ratio;
+    // a token past the end computes on the last one and is not written
+    const int token_in  = sycl::min(token, n_tokens - 1);
 
-    Q += nb03 * sequence + nb02 * head + nb01 * token;
+    Q += nb03 * sequence + nb02 * head + nb01 * token_in;
     K += nb13 * sequence + nb12 * kvh;
     V += nb23 * sequence + nb22 * kvh;
     const sycl::half * maskh =
-        mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * token) : nullptr;
+        mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * token_in) : nullptr;
 
     syclex::work_group_static<sycl::vec<sycl::half, 8>[2 * T * C8]> lsm;
     sycl::vec<sycl::half, 8> * Ks = (sycl::vec<sycl::half, 8> *) &lsm;
@@ -733,7 +773,7 @@ static void flash_attn_ext_vec_gqa(const char * __restrict__ Q, const char * __r
     float kq_max = -FLT_MAX / 2.0f;
     float kq_sum = 0.0f;
 
-    const int k_max = KV_max ? KV_max[sequence * item_ct1.get_group_range(2) + token] : ne11;
+    const int k_max = KV_max ? KV_max[sequence * item_ct1.get_group_range(2) + item_ct1.get_group(2)] : ne11;
     for (int k0 = blk * T; k0 < k_max; k0 += nblk * T) {
         fattn_gqa_fill<type_K, D, T>(K, nb11, k0, k_max, tid, nthreads, Ks);
         fattn_gqa_fill<type_V, D, T>(V, nb21, k0, k_max, tid, nthreads, Vs);
@@ -783,19 +823,21 @@ static void flash_attn_ext_vec_gqa(const char * __restrict__ Q, const char * __r
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
 
-    const int j_dst = (sequence * int(ne01.z()) + token) * ne02 + head;
-    if (nblk == 1) {
+    if (token < n_tokens) {
+        const int j_dst = (sequence * n_tokens + token) * ne02 + head;
+        if (nblk == 1) {
 #pragma unroll
-        for (int i = 0; i < EPL; ++i) {
-            dst[j_dst * D + EPL * lane + i] = acc[i] / kq_sum;
-        }
-    } else {
+            for (int i = 0; i < EPL; ++i) {
+                dst[j_dst * D + EPL * lane + i] = acc[i] / kq_sum;
+            }
+        } else {
 #pragma unroll
-        for (int i = 0; i < EPL; ++i) {
-            dst[(j_dst * nblk + blk) * D + EPL * lane + i] = acc[i];
-        }
-        if (lane == 0) {
-            dst_meta[j_dst * nblk + blk] = make_float2(kq_max, kq_sum);
+            for (int i = 0; i < EPL; ++i) {
+                dst[(j_dst * nblk + blk) * D + EPL * lane + i] = acc[i];
+            }
+            if (lane == 0) {
+                dst_meta[j_dst * nblk + blk] = make_float2(kq_max, kq_sum);
+            }
         }
     }
     GGML_UNUSED_VARS(sinks, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne13, ne31, ne32,
@@ -846,28 +888,43 @@ void ggml_sycl_flash_attn_ext_vec_case(ggml_backend_sycl_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    // GQA with F16, Q8_0 or Q4_0 K/V and up to 8 tokens: a work-group per K/V head, see flash_attn_ext_vec_gqa
+    if constexpr ((D == 128 || D == 256) &&
+                  (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0) &&
+                  (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0)) {
+        if (ggml_sycl_fattn_vec_gqa_supported(dst)) {
+            const int gqa_ratio = Q->ne[2] / dst->src[1]->ne[2];
+            // At most ne11/nbatch parallel blocks, the work-groups beyond one per K/V head: more for short KV,
+            // fewer partial results to combine for long KV. On Meteor Lake 32 took 54 instead of 140 us at 256 KV
+            // and 128 153 instead of 167 us at 1024 KV.
+            const int nbatch = dst->src[1]->ne[1] <= 512 ? 32 : 128;
+            // ncols2 16 so that launch_fattn makes one work-group per K/V head (gqa_ratio <= 16)
+            switch (fattn_vec_gqa_ncols(Q->ne[1], gqa_ratio)) {
+                case 1:
+                    launch_fattn<D, 1, 16, flash_attn_ext_vec_gqa<D, type_K, type_V, 1>, WARP_16_SIZE>(
+                        ctx, dst, gqa_ratio, 0, nbatch, false, false, false);
+                    break;
+                case 2:
+                    launch_fattn<D, 2, 16, flash_attn_ext_vec_gqa<D, type_K, type_V, 2>, WARP_16_SIZE>(
+                        ctx, dst, gqa_ratio * 2, 0, nbatch, false, false, false);
+                    break;
+                case 4:
+                    launch_fattn<D, 4, 16, flash_attn_ext_vec_gqa<D, type_K, type_V, 4>, WARP_16_SIZE>(
+                        ctx, dst, gqa_ratio * 4, 0, nbatch, false, false, false);
+                    break;
+                default:
+                    launch_fattn<D, 8, 16, flash_attn_ext_vec_gqa<D, type_K, type_V, 8>, WARP_16_SIZE>(
+                        ctx, dst, gqa_ratio * 8, 0, nbatch, false, false, false);
+                    break;
+            }
+            return;
+        }
+    }
+
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
         const ggml_tensor * K         = dst->src[1];
         const int           gqa_ratio = Q->ne[2] / K->ne[2];
-        float               max_bias;
-        memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-
-        // GQA with F16, Q8_0 or Q4_0 K/V: a work-group per K/V head, see flash_attn_ext_vec_gqa
-        if constexpr ((D == 128 || D == 256) &&
-                      (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0) &&
-                      (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0)) {
-            if (gqa_ratio >= 2 && gqa_ratio <= 16 && logit_softcap == 0.0f && max_bias == 0.0f && !dst->src[4]) {
-                // At most ne11/nbatch parallel blocks, the work-groups beyond one per K/V head: more for short
-                // KV, fewer partial results to combine for long KV. On Meteor Lake 32 took 54 instead of 140 us
-                // at 256 KV and 128 153 instead of 167 us at 1024 KV.
-                const int nbatch = K->ne[1] <= 512 ? 32 : 128;
-                // ncols2 16 so that launch_fattn makes one work-group per K/V head (gqa_ratio <= 16)
-                launch_fattn<D, 1, 16, flash_attn_ext_vec_gqa<D, type_K, type_V>, WARP_16_SIZE>(
-                    ctx, dst, gqa_ratio, 0, nbatch, false, false, false);
-                return;
-            }
-        }
 
         // other GQA decode with F16 or Q8_0 K/V (other types keep one kernel variant each)
         if constexpr ((type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) ||
