@@ -10747,6 +10747,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : { 256, 1024, 4096 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    // same shape, one prompt ubatch at long context
+    for (auto [type_K, type_V] : std::vector<std::pair<ggml_type, ggml_type>>{
+            { GGML_TYPE_F16, GGML_TYPE_F16 }, { GGML_TYPE_Q4_0, GGML_TYPE_F16 }, { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 } }) {
+        for (int kv : { 16384, 65536 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+        }
+    }
     // q8_0 KV cases with long context (decode and prompt)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   128, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
