@@ -10196,6 +10196,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // K and V caches of different types, e.g. -ctk q4_0 with an F16 V cache: decode, a few tokens and prefill
+    for (int hs : { 128, 256 }) {
+        for (int nb : { 1, 3, 32 }) {
+            for (auto types : std::vector<std::pair<ggml_type, ggml_type>>{
+                     { GGML_TYPE_Q4_0, GGML_TYPE_F16 }, { GGML_TYPE_Q8_0, GGML_TYPE_F16 }, { GGML_TYPE_F16, GGML_TYPE_Q4_0 },
+                     { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 } }) {
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {6, 1}, 1024, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, types.first, types.second));
+            }
+        }
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {

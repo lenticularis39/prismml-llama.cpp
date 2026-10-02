@@ -88,6 +88,13 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
     GGML_ABORT("Not match KV type in vec");
@@ -214,8 +221,15 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_SYCL_FA_ALL_QUANTS
+    // Different K and V types among F16, Q4_0 and Q8_0, e.g. a quantized K cache with an F16 V cache: the
+    // vector kernel has instances for them in every build and the tile kernel converts both to F16.
+    // Otherwise the whole op went to the CPU.
     if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+        for (const ggml_tensor * t : { K, V }) {
+            if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q8_0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+        }
     }
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
