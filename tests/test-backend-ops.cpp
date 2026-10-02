@@ -10208,6 +10208,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GQA with a few tokens (speculative verification), also in the KV cache layout
+    for (int hs : { 128, 256 }) {
+        for (int nb : { 2, 4, 5, 8 }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {6, 1}, 1024, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, type_KV, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 512, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            }
+        }
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
@@ -10750,7 +10762,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // same shape with the KV cache layout (heads interleaved per cell), decode and speculative verification
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0 }) {
         for (int kv : { 65536, 131072 }) {
-            for (int nb : { 1, 8 }) {
+            for (int nb : { 1, 2, 4, 8 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
             }
         }
