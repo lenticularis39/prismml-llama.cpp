@@ -3172,6 +3172,16 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
+        case GGML_TYPE_IQ4_NL:
+            launch_mul_mat_vec_q_moe<QK4_NL, QI4_NL, block_iq4_nl, 2, vec_dot_iq4_nl_q8_1>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ4_XS:
+            launch_mul_mat_vec_q_moe<QK_K, QI4_XS/4, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
         case GGML_TYPE_MXFP4:
             launch_mul_mat_vec_q_moe<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
