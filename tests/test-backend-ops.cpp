@@ -10730,6 +10730,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, 1, 2048));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
     }
+    // and its Q8_0 projections: delta-net qkv, gate and out, shared expert
+    for (auto [m, k] : std::vector<std::pair<int, int>>{ { 8192, 2048 }, { 4096, 2048 }, { 2048, 4096 }, { 512, 2048 } }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

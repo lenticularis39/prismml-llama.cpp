@@ -509,18 +509,15 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
         const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
         const ggml_half  d   = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
 
-        int v[q8_0_traits::vdr_mmvq];
-        int u[q8_0_traits::vdr_mmvq];
-
-#pragma unroll
-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
-            v[i] = get_int_from_int8(qs, iqs + i);
-            u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
-        }
+        // In the reordered layout the quants of a block are 32 contiguous bytes, so the 16 bytes of a work-item
+        // are 16-byte aligned: one load each instead of 8 16-bit loads.
+        static_assert(q8_0_traits::vdr_mmvq == 4, "a work-item takes 16 bytes");
+        const sycl::int4 v = *reinterpret_cast<const sycl::int4 *>(qs + 4 * iqs);
+        const sycl::int4 u = *reinterpret_cast<const sycl::int4 *>(q8_1_quant_ptr + 4 * iqs);
 
         int sumi = 0;
 #pragma unroll
-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+        for (int i = 0; i < 4; ++i) {
             sumi = dpct::dp4a(v[i], u[i], sumi);
         }
 
