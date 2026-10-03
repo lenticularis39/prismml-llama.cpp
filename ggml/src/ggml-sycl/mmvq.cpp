@@ -3103,60 +3103,28 @@ static void launch_mul_mat_vec_q_moe(
     });
 }
 
-// IQ4_NL dot product with a 256-entry table in local memory: the values of the low and high nibble of a byte
-// in bits 0-7 and 16-23. 4 lookups per 32-bit word of quants instead of 8.
+// IQ4_NL dot product with the value table passed in, e.g. a copy in local memory
 static __dpct_inline__ float vec_dot_iq4_nl_q8_1_tbl(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
-                                                     const int & iqs, const uint32_t * tbl) {
+                                                     const int & iqs, const int8_t * values) {
     const block_iq4_nl * bq = (const block_iq4_nl *) vbq;
 
     const uint16_t * q4 = (const uint16_t *) bq->qs + 2 * iqs;
     const int32_t *  q8 = (const int32_t *) bq8_1->qs + iqs;
 
-    int sumi = 0;
-#pragma unroll
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
     for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
         const uint32_t aux = q4[2 * l] | (q4[2 * l + 1] << 16);
-        const uint32_t w0  = tbl[aux & 0xFF] | (tbl[(aux >> 8) & 0xFF] << 8);   // lo0 lo1 hi0 hi1
-        const uint32_t w1  = tbl[(aux >> 16) & 0xFF] | (tbl[aux >> 24] << 8);   // lo2 lo3 hi2 hi3
-        sumi = dpct::dp4a((int) ((w0 & 0xFFFF) | (w1 << 16)), q8[l + 0], sumi);
-        sumi = dpct::dp4a((int) ((w0 >> 16) | (w1 & 0xFFFF0000)), q8[l + 4], sumi);
+        get_int_from_table_16(aux, (const uint8_t *) values, v1, v2);
+        sumi1 = dpct::dp4a(v1, q8[l + 0], sumi1);
+        sumi2 = dpct::dp4a(v2, q8[l + 4], sumi2);
     }
 
     const float d = (float) bq->d * bq8_1->ds[0];
-    return d * sumi;
+    return d * (sumi1 + sumi2);
 }
 
-// IQ3_S dot product with the grid (512 entries) and the sign masks of a nibble (16 entries, 0xFF in the bytes of
-// the set bits) in local memory. A negated byte is (g ^ 0xFF) + 1, so the signs take a second dp4a with the mask's
-// low bits instead of per-byte compares and subtractions.
-static __dpct_inline__ float vec_dot_iq3_s_q8_1_tbl(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
-                                                    const int & iqs, const uint32_t * tbl) {
-    const block_iq3_s * bq = (const block_iq3_s *) vbq;
-
-    const int       ib32 = iqs;
-    const uint8_t * qs   = bq->qs + 8 * ib32;
-    const int *     q8   = (const int *) bq8_1[ib32].qs;
-    const int       qh   = bq->qh[ib32];
-
-    int sumi = 0;
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
-        const uint32_t g1 = tbl[qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256)];
-        const uint32_t g2 = tbl[qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)];
-        const int      sb = bq->signs[4 * ib32 + l];
-        const uint32_t m1 = tbl[512 + (sb & 0xF)];
-        const uint32_t m2 = tbl[512 + (sb >> 4)];
-        sumi = dpct::dp4a((int) (g1 ^ m1), q8[2 * l + 0], sumi);
-        sumi = dpct::dp4a((int) (m1 & 0x01010101), q8[2 * l + 0], sumi);
-        sumi = dpct::dp4a((int) (g2 ^ m2), q8[2 * l + 1], sumi);
-        sumi = dpct::dp4a((int) (m2 & 0x01010101), q8[2 * l + 1], sumi);
-    }
-
-    const float d = (float) bq->d * (1 + 2 * ((bq->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xF)) * bq8_1[ib32].ds[0];
-    return d * sumi;
-}
-
-// MoE mat-vec for IQ types with lookup tables, R rows per work-group (a sub-group per row): the tables and the
+// MoE mat-vec for IQ types with a lookup table, R rows per work-group (a sub-group per row): the table and the
 // rows are first copied to local memory with coalesced 32-bit loads. Read in place, the per-block byte loads
 // and table lookups of the dot product were scattered global loads, 7-10 GB/s on Meteor Lake.
 template <int qk, int qi, typename block_q_t, int vdr, int type, typename table_t, int ntable,
@@ -3183,12 +3151,9 @@ static void mul_mat_vec_q_moe_slm(const void * __restrict__ vx_base, const void 
 
     for (int i = tid; i < ntable; i += nthreads) {
         if constexpr (type == GGML_TYPE_IQ3_S) {
-            const int n = i - 512;
-            tbl[i] = i < 512 ? iq3s_grid[i] :
-                               (n & 1 ? 0xFFu : 0u) | (n & 2 ? 0xFF00u : 0u) | (n & 4 ? 0xFF0000u : 0u) |
-                                   (n & 8 ? 0xFF000000u : 0u);
+            tbl[i] = iq3s_grid[i];
         } else {
-            tbl[i] = (uint8_t) kvalues_iq4nl[i & 0xF] | ((uint32_t) (uint8_t) kvalues_iq4nl[i >> 4] << 16);
+            tbl[i] = kvalues_iq4nl[i];
         }
     }
     if (row < nrows) {
@@ -3362,8 +3327,8 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_IQ3_S:
-            if (launch_mul_mat_vec_q_moe_slm<QK_K, QI3_S/2, block_iq3_s, 1, GGML_TYPE_IQ3_S, uint32_t, 512 + 16,
-                                             vec_dot_iq3_s_q8_1_tbl>(
+            if (launch_mul_mat_vec_q_moe_slm<QK_K, QI3_S/2, block_iq3_s, 1, GGML_TYPE_IQ3_S, uint32_t, 512,
+                                             vec_dot_iq3_s_q8_1>(
                     vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, expert_weight_stride,
                     dst_row_stride, src1_row_stride, stream)) {
                 return true;
@@ -3383,7 +3348,7 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_IQ4_NL:
-            if (launch_mul_mat_vec_q_moe_slm<QK4_NL, QI4_NL, block_iq4_nl, 2, GGML_TYPE_IQ4_NL, uint32_t, 256,
+            if (launch_mul_mat_vec_q_moe_slm<QK4_NL, QI4_NL, block_iq4_nl, 2, GGML_TYPE_IQ4_NL, int8_t, 16,
                                              vec_dot_iq4_nl_q8_1_tbl>(
                     vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, expert_weight_stride,
                     dst_row_stride, src1_row_stride, stream)) {
