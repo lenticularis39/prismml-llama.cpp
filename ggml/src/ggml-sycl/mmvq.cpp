@@ -3103,6 +3103,28 @@ static void launch_mul_mat_vec_q_moe(
     });
 }
 
+// IQ dot products with their lookup tables bound, for launch_mul_mat_vec_q_moe
+static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_t(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+                                                    const int & iqs) {
+    return vec_dot_iq2_xxs_q8_1(vbq, bq8_1, iqs, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+}
+static __dpct_inline__ float vec_dot_iq2_xs_q8_1_t(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+                                                   const int & iqs) {
+    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid, ksigns64);
+}
+static __dpct_inline__ float vec_dot_iq3_xxs_q8_1_t(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+                                                    const int & iqs) {
+    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid, ksigns64);
+}
+static __dpct_inline__ float vec_dot_iq3_s_q8_1_t(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+                                                  const int & iqs) {
+    return vec_dot_iq3_s_q8_1(vbq, bq8_1, iqs, iq3s_grid);
+}
+static __dpct_inline__ float vec_dot_iq1_s_q8_1_t(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+                                                  const int & iqs) {
+    return vec_dot_iq1_s_q8_1(vbq, bq8_1, iqs, iq1s_grid_gpu);
+}
+
 bool ggml_sycl_mul_mat_vec_q_id(
     enum ggml_type     src0_type,
     const void *       vx_base,
@@ -3169,6 +3191,41 @@ bool ggml_sycl_mul_mat_vec_q_id(
             return true;
         case GGML_TYPE_Q6_K:
             launch_mul_mat_vec_q_moe<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ2_XXS:
+            launch_mul_mat_vec_q_moe<QK_K, QI2_XXS/2, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1_t>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ2_XS:
+            launch_mul_mat_vec_q_moe<QK_K, QI2_XS/2, block_iq2_xs, 1, vec_dot_iq2_xs_q8_1_t>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ2_S:
+            launch_mul_mat_vec_q_moe<QK_K, QI2_S/2, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ3_XXS:
+            launch_mul_mat_vec_q_moe<QK_K, QI3_XXS/2, block_iq3_xxs, 1, vec_dot_iq3_xxs_q8_1_t>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ3_S:
+            launch_mul_mat_vec_q_moe<QK_K, QI3_S/2, block_iq3_s, 1, vec_dot_iq3_s_q8_1_t>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ1_S:
+            launch_mul_mat_vec_q_moe<QK_K, QI1_S, block_iq1_s, 1, vec_dot_iq1_s_q8_1_t>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_IQ1_M:
+            launch_mul_mat_vec_q_moe<QK_K, QI1_S, block_iq1_m, 1, vec_dot_iq1_m_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
