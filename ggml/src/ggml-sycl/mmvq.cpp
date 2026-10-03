@@ -3103,6 +3103,118 @@ static void launch_mul_mat_vec_q_moe(
     });
 }
 
+// IQ4_NL dot product with the value table passed in, e.g. a copy in local memory
+static __dpct_inline__ float vec_dot_iq4_nl_q8_1_tbl(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+                                                     const int & iqs, const int8_t * values) {
+    const block_iq4_nl * bq = (const block_iq4_nl *) vbq;
+
+    const uint16_t * q4 = (const uint16_t *) bq->qs + 2 * iqs;
+    const int32_t *  q8 = (const int32_t *) bq8_1->qs + iqs;
+
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+        const uint32_t aux = q4[2 * l] | (q4[2 * l + 1] << 16);
+        get_int_from_table_16(aux, (const uint8_t *) values, v1, v2);
+        sumi1 = dpct::dp4a(v1, q8[l + 0], sumi1);
+        sumi2 = dpct::dp4a(v2, q8[l + 4], sumi2);
+    }
+
+    const float d = (float) bq->d * bq8_1->ds[0];
+    return d * (sumi1 + sumi2);
+}
+
+// MoE mat-vec for IQ types with a lookup table, R rows per work-group (a sub-group per row): the table and the
+// rows are first copied to local memory with coalesced 32-bit loads. Read in place, the per-block byte loads
+// and table lookups of the dot product were scattered global loads, 7-10 GB/s on Meteor Lake.
+template <int qk, int qi, typename block_q_t, int vdr, int type, typename table_t, int ntable,
+          float (*vec_dot)(const void *, const block_q8_1 *, const int &, const table_t *)>
+static void mul_mat_vec_q_moe_slm(const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+                                  float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+                                  const int ncols, const int nrows, const size_t expert_weight_stride,
+                                  const size_t dst_row_stride, const size_t src1_row_stride, uint32_t * slm,
+                                  const sycl::nd_item<3> & item_ct1) {
+    const int expert_idx = item_ct1.get_group(1);
+    const int i02        = ids_dev[expert_idx];
+    const int lane       = item_ct1.get_local_id(2);
+    const int g          = item_ct1.get_local_id(1);
+    const int tid        = g * WARP_SIZE + lane;
+    const int nthreads   = item_ct1.get_local_range(1) * WARP_SIZE;
+
+    const int blocks_per_row = ncols / qk;
+    const int row_words      = blocks_per_row * (int) sizeof(block_q_t) / 4;
+    const int row            = item_ct1.get_group(2) * item_ct1.get_local_range(1) + g;
+
+    constexpr int table_words = (ntable * (int) sizeof(table_t) + 3) / 4;
+    table_t *     tbl         = (table_t *) slm;
+    uint32_t *    xs          = slm + table_words + g * row_words;
+
+    for (int i = tid; i < ntable; i += nthreads) {
+        if constexpr (type == GGML_TYPE_IQ3_S) {
+            tbl[i] = iq3s_grid[i];
+        } else {
+            tbl[i] = kvalues_iq4nl[i];
+        }
+    }
+    if (row < nrows) {
+        const uint32_t * src = (const uint32_t *) ((const char *) vx_base + (size_t) i02 * expert_weight_stride) +
+                               (size_t) row * row_words;
+        for (int i = lane; i < row_words; i += WARP_SIZE) {
+            xs[i] = src[i];
+        }
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (row >= nrows) {
+        return;
+    }
+
+    constexpr int      blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
+    const block_q_t *  x               = (const block_q_t *) xs;
+    const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy_base + (size_t) expert_idx * src1_row_stride);
+
+    float tmp = 0.0f;
+    for (int i = lane / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int iby = i * (qk / QK8_1);
+        for (int elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
+            const int iqs = elem + vdr * (lane % (qi / vdr));
+            tmp += vec_dot(&x[i], &y[iby], iqs, tbl);
+        }
+    }
+    tmp = sycl::reduce_over_group(item_ct1.get_sub_group(), tmp, sycl::plus<float>());
+    if (lane == 0) {
+        ((float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride))[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr, int type, typename table_t, int ntable,
+          float (*vec_dot)(const void *, const block_q8_1 *, const int &, const table_t *)>
+static bool launch_mul_mat_vec_q_moe_slm(const void * vx_base, const void * vy, const int32_t * ids_dev,
+                                         float * dst_base, const int ncols, const int nrows,
+                                         const int n_experts_used, const size_t expert_weight_stride,
+                                         const size_t dst_row_stride, const size_t src1_row_stride,
+                                         dpct::queue_ptr stream) {
+    constexpr int R         = 16;  // the table copy is shared by R rows
+    const size_t  row_bytes = (size_t) (ncols / qk) * sizeof(block_q_t);
+    const size_t  slm_words = (ntable * sizeof(table_t) + 3) / 4 + R * row_bytes / 4;
+    if (row_bytes % 4 != 0 || expert_weight_stride % 4 != 0 || (uintptr_t) vx_base % 4 != 0 ||
+        slm_words * 4 > 32768) {
+        return false;
+    }
+    const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) ((nrows + R - 1) / R));
+    const sycl::range<3> block_dims(1, R, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(slm_words), cgh);
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_moe_slm<qk, qi, block_q_t, vdr, type, table_t, ntable, vec_dot>(
+                                 vx_base, vy, dst_base, ids_dev, ncols, nrows, expert_weight_stride,
+                                 dst_row_stride, src1_row_stride,
+                                 slm.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                         });
+    });
+    return true;
+}
+
 // IQ dot products with their lookup tables bound, for launch_mul_mat_vec_q_moe
 static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_t(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
                                                     const int & iqs) {
@@ -3215,6 +3327,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_IQ3_S:
+            if (launch_mul_mat_vec_q_moe_slm<QK_K, QI3_S/2, block_iq3_s, 1, GGML_TYPE_IQ3_S, uint32_t, 512,
+                                             vec_dot_iq3_s_q8_1>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, expert_weight_stride,
+                    dst_row_stride, src1_row_stride, stream)) {
+                return true;
+            }
             launch_mul_mat_vec_q_moe<QK_K, QI3_S/2, block_iq3_s, 1, vec_dot_iq3_s_q8_1_t>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
@@ -3230,6 +3348,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_IQ4_NL:
+            if (launch_mul_mat_vec_q_moe_slm<QK4_NL, QI4_NL, block_iq4_nl, 2, GGML_TYPE_IQ4_NL, int8_t, 16,
+                                             vec_dot_iq4_nl_q8_1_tbl>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, expert_weight_stride,
+                    dst_row_stride, src1_row_stride, stream)) {
+                return true;
+            }
             launch_mul_mat_vec_q_moe<QK4_NL, QI4_NL, block_iq4_nl, 2, vec_dot_iq4_nl_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);

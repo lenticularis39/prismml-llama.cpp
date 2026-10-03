@@ -10725,6 +10725,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // qwen3.6-35b-a3b decode: 256 experts of 512, IQ3_S gate/up and IQ4_NL down in the UD-IQ4_NL quant
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, 1, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
