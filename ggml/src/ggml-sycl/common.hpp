@@ -228,6 +228,7 @@ struct optimize_feature {
     bool reorder=false;
     bool xmx_pq2=false; // PQ2_0 rewritten into the XMX layout (pq2_xmx.hpp); only that path can read it
     bool t2=false;  // ARC-LAB: PTQ1_0 repacked to the TernSYCL 2-bit layout (ptq1-t2.cpp)
+    bool reorder_ptq1_act=false; // PTQ1_0 in the lane order of mul_mat_vec_ptq1_0_q8_1_act (reorder_qw_ptq1_0_lane)
 };
 
 struct sycl_device_info {

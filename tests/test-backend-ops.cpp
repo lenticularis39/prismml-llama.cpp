@@ -5363,6 +5363,51 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
 }
 
 // GGML_OP_MUL_MAT_ID
+// One weight in a mat-vec and then in a mat-mul. A backend may reorder the weight in place for the mat-vec
+// (SYCL does for PTQ1_0), and the mat-mul must still read it.
+struct test_mul_mat_vec_then_mat : public test_case {
+    const ggml_type type_a;
+    const int64_t   m;
+    const int64_t   k;
+    const int64_t   n;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_THEN_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, k, n);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_vec_then_mat(ggml_type type_a = GGML_TYPE_PTQ1_0, int64_t m = 64, int64_t k = 2048, int64_t n = 16)
+        : type_a(type_a), m(m), k(k), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(x, "x");
+        ggml_set_name(y, "y");
+
+        ggml_tensor * ax = ggml_mul_mat(ctx, a, x);
+        ggml_tensor * ay = ggml_mul_mat(ctx, a, y);
+        ggml_set_name(ax, "ax");
+        ggml_set_name(ay, "ay");
+
+        ggml_tensor * out = ggml_concat(ctx, ax, ay, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -10009,6 +10054,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
     }
+    test_cases.emplace_back(new test_mul_mat_vec_then_mat(GGML_TYPE_PTQ1_0, 64, 2048, 16));
+    test_cases.emplace_back(new test_mul_mat_vec_then_mat(GGML_TYPE_PTQ1_0, 67, 5120, 9));
 
     // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus
     // the mul_mm sizes past it, row counts with a partial 32-row block, and two K lengths

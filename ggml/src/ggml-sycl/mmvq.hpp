@@ -24,6 +24,12 @@ void ggml_sycl_op_mul_mat_vec_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// True if PTQ1_0 weights src0 can use mul_mat_vec_ptq1_0_q8_1_act, and so the lane-ordered reorder.
+bool ggml_sycl_ptq1_0_act_weights(const ggml_tensor * src0);
+
+// True if src1 of this PTQ1_0 mat-vec should be quantized with quantize_q8_1_ptq1_0.
+bool ggml_sycl_ptq1_0_act_layout(const ggml_tensor * src0, const ggml_tensor * src1);
+
 // Requires standard (non-reorder) block layout for src0.
 // Returns false if src0_type isn't handled; caller should fall back.
 bool ggml_sycl_mul_mat_vec_q_id(

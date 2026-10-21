@@ -280,8 +280,15 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             GGML_ASSERT(!(dst->src[0]->extra &&
                           ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.xmx_pq2) &&
                         "PTQ1_0 in the XMX layout reached get_rows");
-            get_rows_sycl_f32<QK_PTQ1_0, 1, dequantize_ptq1_0_f32>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
-            src1_i32, (float *)dst->data, ctx.stream());
+            // a weight shared with a mat-mul may have been reordered by it
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder_ptq1_act) {
+                get_rows_sycl_f32<QK_PTQ1_0, 1, dequantize_ptq1_0_reorder_f32>(ctx, dst->src[0], dst->src[1], dst,
+                    (const float *)dst->src[0]->data, src1_i32, (float *)dst->data, ctx.stream());
+            } else {
+                get_rows_sycl_f32<QK_PTQ1_0, 1, dequantize_ptq1_0_f32>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
+                src1_i32, (float *)dst->data, ctx.stream());
+            }
             break;
         case GGML_TYPE_PQ2_0:
             GGML_ASSERT(!(dst->src[0]->extra &&
