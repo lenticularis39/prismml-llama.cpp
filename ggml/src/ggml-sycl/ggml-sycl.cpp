@@ -4983,6 +4983,14 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
         return;
     }
 
+    // the K-quant SoA reorder kernels are tuned for XMX devices; on a GPU without 16-wide DPAS the
+    // plain MMVQ kernels are faster (measured with the DFlash Q4_K_M draft on Meteor Lake). The
+    // PTQ1_0 lane order and the Q8_0 reorder are not affected.
+    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) &&
+        !ggml_sycl_device_has_dpas16(ctx->device)) {
+        return;
+    }
+
     switch (mm_algorithm) {
         case mul_mat_algo::DMMV:
             if (!ggml_sycl_supports_reorder_dmmv(src0->type)) {
@@ -5014,6 +5022,11 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 // Lazily reorder supported MoE expert weights once their fused path is used.
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
+        return;
+    }
+    // the K-quant SoA reorder GEMV is tuned for XMX devices; on a GPU without 16-wide DPAS the
+    // plain per-expert mat-vec is faster
+    if (!ggml_sycl_device_has_dpas16(ctx->device)) {
         return;
     }
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
