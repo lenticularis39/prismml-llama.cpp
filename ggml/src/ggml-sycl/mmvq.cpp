@@ -3552,8 +3552,8 @@ static void mul_mat_vec_ptq1_0_q8_1_act_sycl(const void * vx, const void * vy, f
     switch (ncols_dst) {
         case 1: PTQ1_0_ACT(4, 1); break;
         case 2: PTQ1_0_ACT(2, 2); break;
-        case 3: PTQ1_0_ACT(2, 3); break;
-        case 4: PTQ1_0_ACT(2, 4); break;
+        case 3: PTQ1_0_ACT(1, 3); break;
+        case 4: PTQ1_0_ACT(1, 4); break;
         case 5: PTQ1_0_ACT(1, 5); break;
         case 6: PTQ1_0_ACT(1, 6); break;
         case 7: PTQ1_0_ACT(1, 7); break;
