@@ -388,7 +388,13 @@ static void launch_gdn_blocked(int variant, const float * q, const float * k, co
         // B580, 1024 tokens (old kernel -> this): 48 heads 3383 -> 1688 us (NC 8, T 8); 32 heads 2762 -> 1024 (NC 4);
         // 4 heads 403 -> 312 (NC 1). NC 8 at 32 heads = 1767, NC 4 at 48 heads = 1934 (more than one round of threads).
         const int64_t cols = H * n_seqs * 128;
-        variant = cols >= 768 * 8 ? 9 : cols >= 768 * 4 ? 3 : cols >= 768 * 2 ? 4 : 5;
+        if (ggml_sycl_info().devices[ggml_sycl_get_device()].dpas_exec_size == 0) {
+            // without XMX the register file fits only NC 4: NC 8 spills ~160 registers at SIMD16.
+            // MTL iGPU, Ternary-Bonsai-2 27B (48 v-heads), 512 tokens: variant 9 79.2 -> variant 10 85.9 t/s
+            variant = cols >= 768 * 4 ? 10 : cols >= 768 * 2 ? 4 : 5;
+        } else {
+            variant = cols >= 768 * 8 ? 9 : cols >= 768 * 4 ? 3 : cols >= 768 * 2 ? 4 : 5;
+        }
     }
     switch (variant) {  // lab sweep (GGML_SYCL_GDN_BLK_VARIANT); NC columns/subgroup, NW subgroups, T tokens/block
         case 1: GDN_BLK(8, 16, 16); break;
