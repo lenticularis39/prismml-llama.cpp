@@ -171,7 +171,17 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     if (mkl_enable == 1 && mask && !sinks && gqa_ratio >= 2 &&
         Q->ne[0] >= 64 && Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 &&
         Q->ne[0] == V->ne[0] &&
-        Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
+        Q->ne[1] >= 32 && K->ne[1] >= 128 && Q->ne[3] == 1 &&
+        // the MKL dequant handles only dense rows or packed interleaved heads (the KV cache layout);
+        // permuted or head-major padded views crash it, and Q batch planes beyond the first give wrong results
+        ((K->nb[1] == (int64_t) ggml_row_size(K->type, K->ne[0]) &&
+          K->nb[2] == K->nb[1] * K->ne[1] &&
+          V->nb[1] == (int64_t) ggml_row_size(V->type, V->ne[0]) &&
+          V->nb[2] == V->nb[1] * V->ne[1]) ||
+         (K->nb[2] == (int64_t) ggml_row_size(K->type, K->ne[0]) &&
+          K->nb[1] == K->nb[2] * K->ne[2] &&
+          V->nb[2] == (int64_t) ggml_row_size(V->type, V->ne[0]) &&
+          V->nb[1] == V->nb[2] * V->ne[2])) &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
         (Q->ne[3] == K->ne[3] || K->ne[3] == 1)) {
         // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
