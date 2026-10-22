@@ -5237,6 +5237,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         return;
     }
 
+    // The scheduler only assigns a batch-mismatched rotation here because of the FWHT path above;
+    // the general mat-mul paths below would compute it wrong
+    if (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+        src0->ne[3] != src1->ne[3]) {
+        GGML_ABORT("hadamard rotation with a batch mismatch did not take the FWHT path");
+    }
+
     if (ggml_sycl_pq2_xmx_use(ctx, src0, src1, dst)) {
         ggml_sycl_pq2_xmx_mul_mat(ctx, src0, src1, dst);
         return;
@@ -6070,7 +6077,15 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT:
             if (dst->src[0]->ne[3] != dst->src[1]->ne[3]) {
-                return false;
+                // a Hadamard rotation with the hint is routed to ggml_sycl_op_fwht inside
+                // ggml_sycl_mul_mat, which transforms the rows of src1 on any batch shape;
+                // only the general mat-mul paths need matching batches
+                const bool hadamard = ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                    (dst->src[1]->type == GGML_TYPE_F32 || dst->src[1]->type == GGML_TYPE_F16) &&
+                    dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst->src[1]) && ggml_is_contiguous(dst);
+                if (!hadamard) {
+                    return false;
+                }
             }
             /* ggml_sycl_mul_mat_id is dependent on ggml_sycl_mul_mat */
             ggml_sycl_mul_mat(ctx, dst->src[0], dst->src[1], dst);
@@ -8048,7 +8063,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
 
-                if (a->ne[3] != b->ne[3]) {
+                // A Hadamard rotation with the hint never reaches the general mat-mul paths: it goes to
+                // ggml_sycl_op_fwht, which transforms the rows of src1 and works on any batch shape.
+                // Without this the scheduler would place every multi-token rotation on the CPU and
+                // split the graph once per layer.
+                const bool hadamard = op->op == GGML_OP_MUL_MAT &&
+                    ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                    (b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16) && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(b) && ggml_is_contiguous(op);
+
+                if (a->ne[3] != b->ne[3] && !hadamard) {
                     return false;
                 }
 
