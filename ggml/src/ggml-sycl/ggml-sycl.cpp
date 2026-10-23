@@ -5289,10 +5289,16 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     // Small batches (e.g. speculative verify) on quantized weights: run MMVQ on chunks of columns
     // instead of dequantizing all of src0 to fp32 (the output matrix is ~5 GB as fp32).
+    // PTQ1_0 with the act-layout kernels chunks at any batch size: the generic GEMM paths for it are
+    // unusable (the w8a8 ratio quantization folds the group scales into int8 and loses up to half a code
+    // value per group, which showed as 3-170 percent dot errors and collapsed long prompts).
+    const bool ptq1_act_chunk = src0->type == GGML_TYPE_PTQ1_0 && ggml_sycl_ptq1_0_act_weights(src0) &&
+        ggml_is_contiguous(src1) && src1->nb[1] == (size_t) src0->ne[0] * sizeof(float);
     if (!split && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src1->ne[1] > MMVQ_MAX_BATCH_SIZE && src1->nb[0] == sizeof(float) &&
-        (src1->ne[1] <= mmvq_chunk_max() || (size_t) src0->ne[0] * src0->ne[1] * sizeof(float) > (1ull << 30))) {
+        (src1->ne[1] <= mmvq_chunk_max() || ptq1_act_chunk ||
+         (size_t) src0->ne[0] * src0->ne[1] * sizeof(float) > (1ull << 30))) {
         for (int64_t c0 = 0; c0 < src1->ne[1]; c0 += MMVQ_MAX_BATCH_SIZE) {
             const int64_t nc = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, src1->ne[1] - c0);
             ggml_tensor src1_c = *src1;
