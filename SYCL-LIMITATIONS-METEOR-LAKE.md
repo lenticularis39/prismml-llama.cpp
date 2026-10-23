@@ -98,6 +98,36 @@ hardware before assuming any of this applies there.
   decoding takes 166 MB checkpoints; these fire only ~2 times per 15 rounds
   and are not a per-round cost.
 
+## The w8a8 int8 GEMM is lossy for PTQ1_0 (fixed by chunking)
+
+- The generic w8a8 path (and the s4 GEMM) folds the f16 group scales into the
+  int8 weights as `round(127 * d_g / D)` (D = row max). For Bonsai-2's PTQ1_0
+  weights the within-row scale dynamic range is wide, so small-scale groups get
+  crushed: measured 3-170 percent dot errors on ~10 percent of outputs. Every
+  kernel in the path is bit-exact against its own definition - the deviation is
+  the approximation itself, not a memory bug.
+- Engagement cliff: matmuls with more than PTQ1_0_ACT_MAX_COLS (256) columns
+  that are not T2-repacked (the GDN/attention projections; the FFN is T2 by
+  name) fall off the MMVQ act kernels into w8a8. Prompts processed in chunks
+  over 256 tokens produced garbage; perplexity 248320 vs 4.88 on CPU. Prompts
+  at or under 256 tokens were fine. This predates the rebase: the original
+  llama-ui runs with 381-token prompts were already past the cliff.
+- Fix (commit "sycl: chunk PTQ1_0 prefill matmuls through the MMVQ act
+  kernels"): PTQ1_0 with act-eligible weights always chunks through the MMVQ
+  act kernels. Correct, but prefill drops from 87 t/s (wrong numbers) to
+  ~28.8 t/s.
+- The fast exact path was attempted and failed: oneDNN `set_scales` with
+  per-group f32 scales is numerically exact in a standalone repro (errors at
+  accumulation-order noise level, works with negative and zero scales), but in
+  the real pipeline it kills the device (UR_RESULT_ERROR_DEVICE_LOST) around
+  the m=17408 call, on both VMM and legacy pools, with private and shared
+  scratchpads. Root cause unknown; revisit on a newer oneDNN.
+- PQ2_0 models use the same lossy ratio scheme and were left on the old path
+  (no model on hand to validate a change).
+- Follow-up option: wider act-kernel column tiles (the switch in
+  `mul_mat_vec_ptq1_0_q8_1_act_sycl` stops at 8 columns; the weight re-reads
+  per 8-column chunk are what limits the chunked path to ~29 t/s).
+
 ## Pre-existing prism bugs found, not fixed (report upstream)
 
 - MUL_MAT_ID (k = 3*blck) intermittent NaN race (q4_0/q4_1/q5_0/q5_1/q8_0).
